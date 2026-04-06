@@ -11,17 +11,10 @@
 **[→ 点击前往 Releases 下载最新版](https://github.com/wnma3mz/Lumina/releases/latest)**
 
 1. 下载 `Lumina.zip`
-2. 解压，把 `Lumina.app` 拖到「应用程序」文件夹
-3. 双击启动
+2. 解压，双击 **`install.command`**
+3. 安装完成后，双击「应用程序」中的 Lumina 启动
 
 首次启动会自动下载模型（约 622MB），下载期间右上角会有进度通知。下载完成后弹出「Lumina 已就绪」通知，即可使用。
-
-> **提示"已损坏"或"无法验证开发者"？**
-> 打开终端，运行：
-> ```bash
-> xattr -cr /Applications/Lumina.app
-> ```
-> 然后直接双击即可。这是 macOS 对未公证 App 的限制，不影响正常使用。
 
 ---
 

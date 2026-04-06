@@ -39,3 +39,8 @@ include = ["lumina*"]
 [tool.black]
 line-length = 120
 target-version = ["py310"]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.19.0",
+]

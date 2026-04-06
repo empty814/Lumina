@@ -227,6 +227,13 @@ def cmd_server(args):
     transcriber = Transcriber()
     logger.info("Whisper model: %s (loaded on first use)", transcriber.model)
 
+    # 检查端口是否已被占用
+    if _is_port_in_use(cfg.host, cfg.port):
+        msg = f"端口 {cfg.port} 已被占用，Lumina 可能已在运行。\n请查看菜单栏图标，或运行 lumina stop 后重试。"
+        print(f"\nERROR: {msg}\n")
+        _notify("Lumina 已在运行", f"端口 {cfg.port} 已被占用，请查看菜单栏图标")
+        sys.exit(1)
+
     fastapi_app = create_app(llm, transcriber)
 
     # 启动完成提示
@@ -331,6 +338,16 @@ def _notify(title: str, message: str):
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
+
+
+def _is_port_in_use(host: str, port: int) -> bool:
+    """检查指定端口是否已被占用。"""
+    import socket
+    # 0.0.0.0 监听时，检查 127.0.0.1 即可判断本机是否已有服务
+    check_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex((check_host, port)) == 0
 
 
 def _print_ready_banner(host: str, port: int):
@@ -604,6 +621,10 @@ def main():
     # "from multiprocessing.resource_tracker import main;main(7)"，需要跳过
     if len(sys.argv) > 1 and sys.argv[1].startswith("from multiprocessing"):
         return
+
+    # 双击 .app 启动时没有参数，默认当 server 运行
+    if len(sys.argv) == 1 and _EDITION in ("full", "lite"):
+        sys.argv.append("server")
 
     args = parser.parse_args()
     args.func(args)
