@@ -41,6 +41,7 @@ a = Analysis(
         'transformers', 'huggingface_hub',
         'aiohttp',
         'pdf2zh', 'pdf2zh.common',
+        'rumps',
     ],
     hookspath=[],
     runtime_hooks=[],

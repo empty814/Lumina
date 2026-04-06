@@ -22,6 +22,9 @@ _EDITION = os.environ.get("LUMINA_EDITION")
 # 用户级配置文件路径（Lite 版首次启动后写入，持久化用户填写的地址）
 _USER_CONFIG_PATH = Path.home() / ".lumina" / "config.json"
 
+# PID 文件，用于 lumina stop 定位进程
+_PID_FILE = Path.home() / ".lumina" / "lumina.pid"
+
 # Full 版内置模型：下载到用户目录，与 App 本体解耦
 _MODEL_REPO_ID = "mlx-community/Qwen3.5-0.8B-4bit"
 _MODEL_CACHE_DIR = Path.home() / ".lumina" / "models" / "qwen3.5-0.8b-4bit"
@@ -104,6 +107,24 @@ def _needs_lite_setup() -> bool:
         except Exception:
             return True
     return True
+
+
+def _write_pid():
+    """写入当前进程 PID 到文件。"""
+    _PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _PID_FILE.write_text(str(os.getpid()))
+
+
+def _read_pid() -> int | None:
+    """读取 PID 文件，返回 PID；文件不存在或内容无效则返回 None。"""
+    try:
+        return int(_PID_FILE.read_text().strip())
+    except Exception:
+        return None
+
+
+def _remove_pid():
+    _PID_FILE.unlink(missing_ok=True)
 
 
 def _ensure_model():
@@ -206,12 +227,81 @@ def cmd_server(args):
     transcriber = Transcriber()
     logger.info("Whisper model: %s (loaded on first use)", transcriber.model)
 
-    app = create_app(llm, transcriber)
+    fastapi_app = create_app(llm, transcriber)
 
-    # 启动完成提示（Full 版更显眼）
+    # 启动完成提示
     _print_ready_banner(cfg.host, cfg.port)
 
-    uvicorn.run(app, host=cfg.host, port=cfg.port, log_level=cfg.log_level.lower())
+    # 写 PID 文件（供 lumina stop / lumina restart 使用）
+    _write_pid()
+
+    if _EDITION in ("full", "lite"):
+        # App 模式：rumps 菜单栏占主线程，uvicorn 跑后台线程
+        _run_with_menubar(fastapi_app, cfg)
+    else:
+        # CLI / 开发模式：前台直接跑 uvicorn
+        try:
+            uvicorn.run(fastapi_app, host=cfg.host, port=cfg.port, log_level=cfg.log_level.lower())
+        finally:
+            _remove_pid()
+
+
+def _run_with_menubar(fastapi_app, cfg):
+    """启动 rumps 菜单栏 App，uvicorn 在后台线程运行。"""
+    import threading
+    import uvicorn
+    import rumps
+
+    edition_label = {"full": "Full", "lite": "Lite"}.get(_EDITION, "")
+    title = f"Lumina {edition_label}".strip()
+
+    server = uvicorn.Server(uvicorn.Config(
+        fastapi_app,
+        host=cfg.host,
+        port=cfg.port,
+        log_level=cfg.log_level.lower(),
+    ))
+
+    def _serve():
+        import asyncio
+        asyncio.run(server.serve())
+
+    t = threading.Thread(target=_serve, daemon=True)
+    t.start()
+
+    class LuminaApp(rumps.App):
+        def __init__(self):
+            super().__init__(title, quit_button=None)
+            self.menu = [
+                rumps.MenuItem(f"打开界面", callback=self._open_ui),
+                None,  # 分隔线
+                rumps.MenuItem("重启服务", callback=self._restart),
+                rumps.MenuItem("退出 Lumina", callback=self._quit),
+            ]
+
+        def _open_ui(self, _):
+            import subprocess
+            subprocess.Popen(["open", f"http://127.0.0.1:{cfg.port}"])
+
+        def _restart(self, _):
+            server.should_exit = True
+            t.join(timeout=5)
+            _remove_pid()
+            import subprocess, sys
+            subprocess.Popen([sys.executable] + sys.argv)
+            rumps.quit_application()
+
+        def _quit(self, _):
+            server.should_exit = True
+            t.join(timeout=5)
+            _remove_pid()
+            rumps.quit_application()
+
+    try:
+        LuminaApp().run()
+    finally:
+        server.should_exit = True
+        _remove_pid()
 
 
 def _get_lan_ip() -> str | None:
@@ -262,6 +352,43 @@ def _print_ready_banner(host: str, port: int):
     print()
 
     _notify("Lumina 已就绪", f"服务运行于 http://127.0.0.1:{port}")
+
+
+def cmd_stop(args):
+    """杀死正在运行的 Lumina 服务进程。"""
+    import signal
+    pid = _read_pid()
+    if pid is None:
+        print("Lumina 未在运行（未找到 PID 文件）。")
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+        _remove_pid()
+        print(f"已停止 Lumina（PID {pid}）。")
+    except ProcessLookupError:
+        print(f"进程 {pid} 不存在，清理 PID 文件。")
+        _remove_pid()
+    except PermissionError:
+        print(f"无权限停止进程 {pid}，请用 sudo。")
+
+
+def cmd_restart(args):
+    """停止当前 Lumina 进程，然后重新启动服务。"""
+    import signal
+    pid = _read_pid()
+    if pid is not None:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            print(f"已停止 Lumina（PID {pid}）。")
+        except ProcessLookupError:
+            pass
+        _remove_pid()
+
+    # 用相同参数重新启动
+    import subprocess
+    cmd = [sys.argv[0], "server"]
+    print("正在重启 Lumina…")
+    subprocess.Popen(cmd)
 
 
 def cmd_pdf(args):
@@ -413,6 +540,14 @@ def main():
     p_server.add_argument("--log-level", dest="log_level", default=None,
                           choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     p_server.set_defaults(func=cmd_server)
+
+    # ── lumina stop ───────────────────────────────────────────────────────────
+    p_stop = sub.add_parser("stop", help="Stop the running Lumina service")
+    p_stop.set_defaults(func=cmd_stop)
+
+    # ── lumina restart ────────────────────────────────────────────────────────
+    p_restart = sub.add_parser("restart", help="Restart the Lumina service")
+    p_restart.set_defaults(func=cmd_restart)
 
     # ── lumina pdf ────────────────────────────────────────────────────────────
     p_pdf = sub.add_parser("pdf", help="Translate PDF file(s) via pdf2zh")
