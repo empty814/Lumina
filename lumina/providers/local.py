@@ -1,40 +1,55 @@
 """
 LocalProvider：使用本地 mlx-lm 模型进行推理（默认 Provider）。
 
-并发策略：
-  MLX 的 GPU 推理不可真正并行，但可以通过请求队列做 Dynamic Batching——
-  把短时间内到达的多个请求合并成一个 batch 一起推理，显著提升吞吐量。
+并发策略（Continuous Batching，仿 tLLM AsyncEngine）：
 
-  实现方式：
-    - 每个 generate_stream 调用将请求放入全局 _RequestQueue
-    - 后台 BatchWorker 轮询队列，收集 pending 请求后一起送入 mlx-lm
-    - 每个请求独立维护自己的结果 asyncio.Queue，流式 yield 给调用方
+  旧方案（Dynamic Batching）：
+    - 收集短窗口内的请求，串行跑完整个 stream_generate
+    - 请求 B 必须等请求 A 全部生成完才开始 → TTFT(B) = O(max_tokens_A × latency)
+
+  新方案（Continuous Batching）：
+    - prefill_queue：新请求入队
+    - _active：正在 decode 的 _RequestSlot，每个持有 KV cache + step_iter
+    - 调度循环每次迭代：
+        1. 从 prefill_queue 取新请求执行 prefill + 首 token，put 到 slot.token_queue
+        2. 对 _active 中已存在的请求各推进 1 步，put 到 slot.token_queue
+        3. 结束标志（None）put 到已完成请求的 queue
+    - 消费方从 token_queue.get() 流式消费，天然线程安全、无竞争
+    - 效果：TTFT(B) ≈ prefill(A) + 1 step，而非等 A 全部完成
 """
 import asyncio
+import threading
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Dict, List, Optional
+from typing import AsyncIterator, Iterator, List, Optional, Tuple
 import uuid
 
 import mlx.core as mx
-from mlx_lm import load, stream_generate
+from mlx_lm import load
+from mlx_lm.generate import generate_step, cache as mlx_cache
 from mlx_lm.sample_utils import make_sampler
 
 from .base import BaseProvider
 
-# 每次 batch 最多合并的请求数（避免 OOM）
-_MAX_BATCH = 8
-# 批次聚合等待窗口（秒）——等这么久收集更多请求后再一起处理
-_BATCH_WINDOW = 0.02
+# 每次迭代最多接入的新 prefill 请求数
+_MAX_NEW_PREFILL_PER_ITER = 2
 
 
 @dataclass
-class _PendingRequest:
+class _RequestSlot:
+    """一个请求的完整生命周期状态。"""
     request_id: str
-    prompt: str
+    prompt_tokens: mx.array
     max_tokens: int
     temperature: float
-    # 结果通道：worker 通过此 queue 向调用方 yield token
-    result_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+
+    # 调度线程把 token 文本 put 进来，None = 结束，Exception = 错误
+    # asyncio.Queue：跨线程安全（run_coroutine_threadsafe put）+ 协程 get
+    token_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+
+    # 调度线程写入（在 prefill 完成后）
+    step_iter: Optional[Iterator[Tuple[int, mx.array]]] = None
+    _token_ids: List[int] = field(default_factory=list)
+    n_tokens: int = 0
     done: bool = False
 
 
@@ -43,10 +58,14 @@ class LocalProvider(BaseProvider):
         self.model_path = model_path
         self._model = None
         self._tokenizer = None
-        # Queue 不在 __init__ 里创建：__init__ 可能在同步上下文（主线程）运行，
-        # 而 Queue 必须绑定到真正使用它的 asyncio 事件循环，否则会报 "bound to a different event loop"。
-        self._queue: Optional[asyncio.Queue] = None
+        self._prefill_queue: Optional[asyncio.Queue] = None
+        self._not_empty: Optional[asyncio.Event] = None
         self._worker_task: Optional[asyncio.Task] = None
+        self._active: List[_RequestSlot] = []
+        self._active_lock = threading.Lock()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+    # ── 生命周期 ──────────────────────────────────────────────────────────────
 
     def load(self):
         self._model, self._tokenizer = load(self.model_path)
@@ -57,77 +76,163 @@ class LocalProvider(BaseProvider):
         return self._model is not None
 
     def _ensure_worker(self):
-        """确保后台 BatchWorker 已启动（懒启动，首次请求时创建）。在事件循环内调用，Queue 在此绑定到正确的 loop。"""
-        if self._queue is None:
-            self._queue = asyncio.Queue()
+        if self._prefill_queue is None:
+            self._prefill_queue = asyncio.Queue()
+            self._not_empty = asyncio.Event()
         if self._worker_task is None or self._worker_task.done():
-            self._worker_task = asyncio.create_task(self._batch_worker())
+            self._loop = asyncio.get_running_loop()
+            self._worker_task = asyncio.create_task(self._scheduler())
 
-    def _build_prompt(self, system: str, user_text: str) -> str:
+    # ── Prompt 构建 ───────────────────────────────────────────────────────────
+
+    def _build_prompt_tokens(self, system: str, user_text: str) -> mx.array:
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user_text},
         ]
-        return self._tokenizer.apply_chat_template(
+        prompt_str = self._tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
+        return mx.array(self._tokenizer.encode(prompt_str))
 
-    def _run_batch_sync(self, requests: List[_PendingRequest], loop: asyncio.AbstractEventLoop):
-        """
-        在 executor 线程中同步执行一批请求。
-        mlx-lm 当前不原生支持多 prompt batch 流式，因此逐个串行推理，
-        但仍比"锁住整个 generate_stream 协程"更优：
-          - 批次内请求顺序处理，批次外请求可在当前批次收集期间入队
-          - 未来可换成真正的 batch forward（mlx-lm roadmap）
-        """
-        for req in requests:
-            sampler = make_sampler(temp=req.temperature, top_p=0.9)
-            try:
-                for response in stream_generate(
-                    self._model,
-                    self._tokenizer,
-                    prompt=req.prompt,
-                    max_tokens=req.max_tokens,
-                    sampler=sampler,
-                ):
-                    asyncio.run_coroutine_threadsafe(
-                        req.result_queue.put(response.text), loop
-                    )
-                    if response.finish_reason is not None:
-                        break
-            except Exception as e:
-                asyncio.run_coroutine_threadsafe(
-                    req.result_queue.put(RuntimeError(str(e))), loop
-                )
-            finally:
-                asyncio.run_coroutine_threadsafe(
-                    req.result_queue.put(None), loop  # 结束哨兵
-                )
+    # ── EOS token ids ─────────────────────────────────────────────────────────
 
-    async def _batch_worker(self):
+    @property
+    def _eos_ids(self) -> set:
+        eos = self._tokenizer.eos_token_id
+        if isinstance(eos, list):
+            return set(eos)
+        return {eos} if eos is not None else set()
+
+    # ── 同步推理（executor 线程）─────────────────────────────────────────────
+
+    def _put_token(self, slot: _RequestSlot, value) -> None:
+        """线程安全地往 asyncio Queue put 值（在 executor 线程中调用）。"""
+        asyncio.run_coroutine_threadsafe(slot.token_queue.put(value), self._loop)
+
+    def _do_prefill(self, slot: _RequestSlot) -> None:
         """
-        后台协程：持续从队列收集请求，凑成 batch 后送去推理。
+        执行 prefill + 生成首 token。
+        结果通过 slot.token_queue 传递。
         """
+        sampler = make_sampler(temp=slot.temperature, top_p=0.9)
+        prompt_cache = mlx_cache.make_prompt_cache(self._model)
+        eos_ids = self._eos_ids
+        try:
+            step_iter = generate_step(
+                prompt=slot.prompt_tokens,
+                model=self._model,
+                max_tokens=slot.max_tokens,
+                sampler=sampler,
+                prompt_cache=prompt_cache,
+            )
+            slot.step_iter = step_iter
+            token_id, _ = next(step_iter)
+
+            if token_id in eos_ids:
+                slot.done = True
+                self._put_token(slot, None)  # 立即结束
+                return
+
+            slot._token_ids = [token_id]
+            text = self._tokenizer.decode([token_id])
+            slot.n_tokens = 1
+            self._put_token(slot, text)
+
+            if slot.n_tokens >= slot.max_tokens:
+                slot.done = True
+                self._put_token(slot, None)
+
+        except StopIteration:
+            slot.done = True
+            self._put_token(slot, None)
+        except Exception as e:
+            slot.done = True
+            self._put_token(slot, e)
+
+    def _advance_one(self, slot: _RequestSlot) -> None:
+        """推进一个 decode step，结果 put 到 token_queue。"""
+        eos_ids = self._eos_ids
+        try:
+            token_id, _ = next(slot.step_iter)
+        except StopIteration:
+            slot.done = True
+            self._put_token(slot, None)
+            return
+        except Exception as e:
+            slot.done = True
+            self._put_token(slot, e)
+            return
+
+        if token_id in eos_ids:
+            slot.done = True
+            self._put_token(slot, None)
+            return
+
+        prev_text = self._tokenizer.decode(slot._token_ids)
+        slot._token_ids.append(token_id)
+        new_text = self._tokenizer.decode(slot._token_ids)
+        delta = new_text[len(prev_text):]
+        slot.n_tokens += 1
+        self._put_token(slot, delta)
+
+        if slot.n_tokens >= slot.max_tokens:
+            slot.done = True
+            self._put_token(slot, None)
+
+    def _run_one_iter(self, prefill_list: List[_RequestSlot]) -> None:
+        """
+        单次调度迭代（executor 线程）：
+          1. 先快照当前 _active（Phase 2 只处理这些）
+          2. prefill 新请求，加入 _active
+          3. decode 快照中的请求
+          4. 清理完成请求
+        """
+        # Phase 1 前先快照（本轮新 prefill 的请求不参与 Phase 2）
+        with self._active_lock:
+            decode_batch = [s for s in self._active if not s.done]
+
+        # Phase 1: prefill
+        newly_active = []
+        for slot in prefill_list:
+            self._do_prefill(slot)
+            if not slot.done:
+                newly_active.append(slot)
+
+        with self._active_lock:
+            self._active.extend(newly_active)
+
+        # Phase 2: decode（快照，不含本轮新 prefill）
+        for slot in decode_batch:
+            if not slot.done:
+                self._advance_one(slot)
+
+        # 清理
+        with self._active_lock:
+            self._active = [s for s in self._active if not s.done]
+
+    # ── 调度主循环 ────────────────────────────────────────────────────────────
+
+    async def _scheduler(self) -> None:
         loop = asyncio.get_running_loop()
         while True:
-            # 等待至少一个请求
-            first = await self._queue.get()
-            batch = [first]
+            with self._active_lock:
+                has_active = bool(self._active)
 
-            # 在短窗口内继续收集更多请求（Dynamic Batching）
-            deadline = loop.time() + _BATCH_WINDOW
-            while len(batch) < _MAX_BATCH:
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    break
+            if not has_active and self._prefill_queue.empty():
+                self._not_empty.clear()
+                await self._not_empty.wait()
+
+            prefill_list: List[_RequestSlot] = []
+            while len(prefill_list) < _MAX_NEW_PREFILL_PER_ITER:
                 try:
-                    req = await asyncio.wait_for(self._queue.get(), timeout=remaining)
-                    batch.append(req)
-                except asyncio.TimeoutError:
+                    prefill_list.append(self._prefill_queue.get_nowait())
+                except asyncio.QueueEmpty:
                     break
 
-            # 在线程池中执行同步推理，避免阻塞事件循环
-            await loop.run_in_executor(None, self._run_batch_sync, batch, loop)
+            await loop.run_in_executor(None, self._run_one_iter, prefill_list)
+
+    # ── 公共接口 ──────────────────────────────────────────────────────────────
 
     async def generate_stream(
         self,
@@ -142,19 +247,20 @@ class LocalProvider(BaseProvider):
         self._ensure_worker()
 
         system_str = system or "You are a helpful assistant."
-        prompt = self._build_prompt(system_str, user_text)
+        prompt_tokens = self._build_prompt_tokens(system_str, user_text)
 
-        req = _PendingRequest(
+        slot = _RequestSlot(
             request_id=uuid.uuid4().hex,
-            prompt=prompt,
+            prompt_tokens=prompt_tokens,
             max_tokens=max_tokens,
             temperature=temperature,
         )
-        await self._queue.put(req)
+        await self._prefill_queue.put(slot)
+        self._not_empty.set()
 
-        # 从结果队列 yield token
+        # 从 token_queue 流式消费：None = 结束，Exception = 错误
         while True:
-            item = await req.result_queue.get()
+            item = await slot.token_queue.get()
             if item is None:
                 break
             if isinstance(item, Exception):
