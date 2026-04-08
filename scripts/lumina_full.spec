@@ -56,7 +56,7 @@ a = Analysis(
         # torch：mlx-whisper 的 metadata 依赖，Apple Silicon 运行时不需要
         # 排除节省 ~356MB 体积 + ~8s Analysis 时间
         'torch', 'torchvision', 'torchaudio',
-        'pytest', 'unittest',
+        'pytest',
         'IPython', 'jupyter', 'notebook', 'ipykernel',
         'tkinter', '_tkinter', 'wx', 'gi',
         'black', 'isort', 'mypy', 'pylint', 'flake8',
