@@ -597,6 +597,13 @@ def main():
     # 子进程逻辑，然后退出，不会走到下面的 argparse。
     import multiprocessing
     multiprocessing.freeze_support()
+    # babeldoc 用 multiprocessing.Process 做字体子集化；macOS 默认 spawn 会重走
+    # CLI 入口导致 argparse 报错。fork 模式直接复制父进程内存，不重走入口。
+    # 放在 freeze_support() 之后、任何业务代码之前；打包版和开发版均生效。
+    try:
+        multiprocessing.set_start_method("fork")
+    except RuntimeError:
+        pass  # 已在子进程中，无法再设置（理论上不会到这里）
 
     parser = argparse.ArgumentParser(
         prog="lumina",
@@ -685,10 +692,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # babeldoc（pdf2zh 依赖）用 multiprocessing.Process 做字体子集化。
-    # macOS 默认 spawn 模式会用 sys.executable 重启本进程并 import __main__，
-    # 导致 argparse 报错。改成 fork 避免重走 CLI 入口。
-    # 必须在 freeze_support() 之前设置，且只在 __main__ 里设置（子进程不再执行此处）。
-    import multiprocessing
-    multiprocessing.set_start_method("fork")
     main()
