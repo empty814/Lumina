@@ -88,6 +88,11 @@ bash scripts/build_full.sh    # 打包为 Lumina.app
 
 - `tests/fixtures/2010_Bottou_SGD.pdf` — 10 页英文论文，用于 PDF 翻译/总结功能的快速测试（约 40s 完成）
 
+## Git 操作规范
+
+- **禁止在未经用户明确许可的情况下 push 到远端**（包括 `git push`、`gh release`）
+- commit 可以随时做，push / release 必须等用户说「可以 push」或「发包」
+
 ## 已知问题 / 注意事项
 
 - **网络代理**：所有外部下载失败时用 `HTTP_PROXY=http://127.0.0.1:7890`
