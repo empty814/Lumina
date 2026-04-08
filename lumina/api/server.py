@@ -403,13 +403,12 @@ def create_app(llm: LLMEngine, transcriber: Transcriber) -> FastAPI:
     @app.post("/v1/digest/refresh")
     async def refresh_digest_api(background_tasks: BackgroundTasks):
         from lumina.digest import maybe_generate_digest
-        import threading
+        import asyncio
 
-        def _run():
-            import asyncio
-            asyncio.run(maybe_generate_digest(llm, force_full=True))
+        async def _run():
+            await maybe_generate_digest(llm, force_full=True)
 
-        background_tasks.add_task(lambda: threading.Thread(target=_run, daemon=True).start())
+        background_tasks.add_task(_run)
         return {"status": "refreshing"}
 
     @app.get("/v1/digest/debug")
