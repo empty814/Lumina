@@ -157,9 +157,9 @@
   </header>
 
   <div class="tabs">
-    <button class="tab-btn active" data-tab="translate" onclick="switchTab('translate')">📄 翻译</button>
+    <button class="tab-btn active" data-tab="digest" onclick="switchTab('digest')">📋 日报</button>
+    <button class="tab-btn" data-tab="translate" onclick="switchTab('translate')">📄 翻译</button>
     <button class="tab-btn" data-tab="summarize" onclick="switchTab('summarize')">📝 总结</button>
-    <button class="tab-btn" data-tab="digest" onclick="switchTab('digest')">📋 日报</button>
   </div>
 
   <main>
@@ -597,8 +597,21 @@ async function refreshDigest() {
   }
 }
 
+// 日报自动刷新：tab 可见时每 5 分钟静默拉取一次
+let _digestAutoTimer = null;
+function _startDigestAutoRefresh() {
+  _stopDigestAutoRefresh();
+  _digestAutoTimer = setInterval(() => {
+    if (document.getElementById('panel-digest').classList.contains('active')) loadDigest();
+  }, 5 * 60 * 1000);
+}
+function _stopDigestAutoRefresh() {
+  if (_digestAutoTimer) { clearInterval(_digestAutoTimer); _digestAutoTimer = null; }
+}
+
 window.addEventListener('load', () => {
   if (document.getElementById('panel-digest').classList.contains('active')) loadDigest();
+  _startDigestAutoRefresh();
 });
 
 // ── Debug panel ──
