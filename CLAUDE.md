@@ -64,6 +64,37 @@ bash scripts/build_full.sh    # 打包为 Lumina.app
 - 调度器：Phase 1 prefill 新请求，Phase 2 只推进 **prefill 前已存在** 的 slot（快照 `existing_decode`），防止首 token 被覆盖
 - EOS 检测：mlx-lm `generate_step` 不自动停，手动检测 token id 248046（`<|im_end|>`）
 
+### Per-Collector Cursors（采集器游标）
+
+每个 collector 独立记录「上次采集到的最新记录时间戳」，下次只读新数据，各来源互不影响。
+
+**存储：** `~/.lumina/collector_cursors.json`，格式 `{"collect_xxx": unix_timestamp_float}`，由 `cursor_store.py` 原子读写。
+
+**流程：**
+1. `_collect_all()` 开始时调用 `load_cursors()` 读取 cursor 文件
+2. 注入 `_collectors_mod._CURSORS`（含各 collector cursor + `"_fallback"` 哨兵 = `now - effective_hours`）
+3. `ThreadPoolExecutor` 启动，各 collector 调用 `_get_cursor(name)` 读自己的 cursor，采集完后调用 `_set_cursor(name, newest_ts)` 写回
+4. executor 结束后，`core.py` 调用 `save_cursors()` 持久化
+
+**各来源 cursor 语义：**
+
+| Collector | cursor 单位 | 数据源字段 | 兜底 |
+|---|---|---|---|
+| collect_shell_history | Unix 秒 | zsh `: ts:0;cmd` 前缀 | 文件无时间戳 → 取最近 100 条，不更新 cursor |
+| collect_git_logs | Unix 秒 → `--since=` | `git log --format=%ct` | cursor=fallback |
+| collect_clipboard | 无 cursor（无状态） | — | — |
+| collect_browser_history | Unix 秒（查询时转换）| Chrome: `last_visit_time`（Chrome epoch µs）；Firefox: `last_visit_date`（Unix µs） | cursor=fallback |
+| collect_notes_app | Unix 秒（查询时 `-978307200` 转 CoreData epoch） | `ZMODIFICATIONDATE1` | cursor=fallback |
+| collect_markdown_notes | Unix 秒 | `st_mtime` | cursor=fallback |
+| collect_ai_queries | Unix 秒（各子来源统一转换）| Cursor IDE 无时间戳，用 db mtime | cursor=fallback |
+
+**兜底机制：**
+- cursor 文件缺失/损坏 → `load_cursors()` 返回 `{}`，所有 collector 使用 `_fallback`（= `now - effective_hours`）
+- 单个 collector 无 cursor → 使用 `_fallback`
+- `effective_hours = min(距上次生成时长, cfg.history_hours)`，见下节「日报定时生成」
+
+**重置方法：** 删除 `~/.lumina/collector_cursors.json`（全部重置）或删除其中某个 key（单个来源重置），下次采集自动用 `history_hours` 作为初始窗口。
+
 ### 日报定时生成
 - `.app` 模式：`rumps.timer(3600)` 在 `_run_with_menubar()` 中触发
 - 命令行模式：`_start_digest_timer(llm)` 用 `threading.Timer` 循环，行为一致

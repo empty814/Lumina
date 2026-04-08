@@ -10,7 +10,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import lumina.digest.collectors as _collectors_mod
 from lumina.digest.config import get_cfg, override_history_hours
+from lumina.digest.cursor_store import load_cursors, save_cursors
 from lumina.digest.collectors import (
     collect_shell_history,
     collect_git_logs,
@@ -122,11 +124,21 @@ async def _collect_all(since_ts: Optional[float] = None) -> str:
     else:
         effective_hours = cfg.history_hours
 
+    # ── 注入 per-collector cursor ─────────────────────────────────────────────
+    cursors = load_cursors()
+    cursors["_fallback"] = time.time() - effective_hours * 3600
+    _collectors_mod._CURSORS = cursors          # 线程启动前写入，collector 只读
+
     loop = asyncio.get_running_loop()
     with override_history_hours(effective_hours):
         with ThreadPoolExecutor(max_workers=len(_COLLECTORS)) as executor:
             futures = [loop.run_in_executor(executor, fn) for fn in _COLLECTORS]
             results = await asyncio.gather(*futures, return_exceptions=True)
+
+    # ── 保存 collector 写回的 cursor（去掉内部哨兵 key）─────────────────────
+    updated = {k: v for k, v in _collectors_mod._CURSORS.items()
+               if not k.startswith("_")}
+    save_cursors(updated)
 
     cache = {}
     sections = []
@@ -326,4 +338,5 @@ def get_debug_info() -> dict:
         "last_generated_ts": _last_generated_ts,
         "activity_check": _last_activity_check,
         "collectors": _last_collector_results,
+        "cursors": load_cursors(),
     }
