@@ -253,11 +253,14 @@ def cmd_server(args):
         _run_digest_task(llm, changelog=True)    # 增量：有新活动则立即追加，无则跳过
     threading.Thread(target=_startup_digest, daemon=True).start()
 
+    # LUMINA_DIGEST_INTERVAL 可在环境变量里覆盖（测试用），命令行参数优先
+    _env_interval = int(os.environ.get("LUMINA_DIGEST_INTERVAL", 3600))
+    digest_interval = getattr(args, "digest_interval", _env_interval)
+    _start_digest_timer(llm, interval=digest_interval)
+
     if _EDITION in ("full", "lite"):
         _run_with_menubar(fastapi_app, cfg, llm)
     else:
-        # 命令行模式：每小时定时生成 changelog（与 menubar 模式行为一致）
-        _start_digest_timer(llm)
         try:
             uvicorn.run(fastapi_app, host=cfg.host, port=cfg.port, log_level=cfg.log_level.lower())
         finally:
@@ -348,13 +351,6 @@ def _run_with_menubar(fastapi_app, cfg, llm):
             t.join(timeout=5)
             _remove_pid()
             rumps.quit_application()
-
-        @rumps.timer(3600)
-        def _on_digest_timer(self, _):
-            """每小时检测增量变化，有则生成 Change Log。"""
-            threading.Thread(
-                target=_run_digest_task, args=(llm, True), daemon=True
-            ).start()
 
     try:
         app = LuminaApp()
@@ -622,6 +618,8 @@ def main():
     p_server.add_argument("--whisper-model", dest="whisper_model", default=None)
     p_server.add_argument("--log-level", dest="log_level", default=None,
                           choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    p_server.add_argument("--digest-interval", dest="digest_interval", type=int, default=3600,
+                          help="日报定时间隔（秒），默认 3600，测试时可改小如 30")
     p_server.set_defaults(func=cmd_server)
 
     # ── lumina stop ───────────────────────────────────────────────────────────
