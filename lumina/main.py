@@ -252,6 +252,8 @@ def cmd_server(args):
     if _EDITION in ("full", "lite"):
         _run_with_menubar(fastapi_app, cfg, llm)
     else:
+        # 命令行模式：每小时定时生成 changelog（与 menubar 模式行为一致）
+        _start_digest_timer(llm)
         try:
             uvicorn.run(fastapi_app, host=cfg.host, port=cfg.port, log_level=cfg.log_level.lower())
         finally:
@@ -266,6 +268,22 @@ def _run_digest_task(llm, changelog: bool = False):
         asyncio.run(maybe_generate_changelog(llm))
     else:
         asyncio.run(maybe_generate_digest(llm))
+
+
+def _start_digest_timer(llm, interval: int = 3600):
+    """每小时在后台线程生成 changelog（命令行模式，与 menubar 的 rumps.timer 行为一致）。"""
+    import threading
+
+    def _loop():
+        t = threading.Timer(interval, _loop)
+        t.daemon = True
+        t.start()
+        _run_digest_task(llm, changelog=True)
+
+    t = threading.Timer(interval, _loop)
+    t.daemon = True
+    t.start()
+    logger.info("Digest timer started (interval=%ds)", interval)
 
 
 def _run_with_menubar(fastapi_app, cfg, llm):
@@ -570,6 +588,12 @@ def cmd_summarize(args):
 
 
 def main():
+    # PyInstaller 打包后 multiprocessing 子进程（resource_tracker / pool worker）
+    # 会用 sys.executable 重新调用本进程，freeze_support() 在此时拦截并执行
+    # 子进程逻辑，然后退出，不会走到下面的 argparse。
+    import multiprocessing
+    multiprocessing.freeze_support()
+
     parser = argparse.ArgumentParser(
         prog="lumina",
         description="Lumina — local LLM service",
@@ -648,11 +672,6 @@ def main():
                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     p_pol.set_defaults(func=cmd_polish)
 
-    # PyInstaller multiprocessing 会用 sys.argv 拉起子进程，argv[1] 形如
-    # "from multiprocessing.resource_tracker import main;main(7)"，需要跳过
-    if len(sys.argv) > 1 and sys.argv[1].startswith("from multiprocessing"):
-        return
-
     # 双击 .app 启动时没有参数，默认当 server 运行
     if len(sys.argv) == 1 and _EDITION in ("full", "lite"):
         sys.argv.append("server")
@@ -662,4 +681,10 @@ def main():
 
 
 if __name__ == "__main__":
+    # babeldoc（pdf2zh 依赖）用 multiprocessing.Process 做字体子集化。
+    # macOS 默认 spawn 模式会用 sys.executable 重启本进程并 import __main__，
+    # 导致 argparse 报错。改成 fork 避免重走 CLI 入口。
+    # 必须在 freeze_support() 之前设置，且只在 __main__ 里设置（子进程不再执行此处）。
+    import multiprocessing
+    multiprocessing.set_start_method("fork")
     main()
