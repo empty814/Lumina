@@ -95,3 +95,9 @@ def get_config(path: Optional[str] = None) -> Config:
     if _instance is None:
         _instance = Config(path)
     return _instance
+
+
+def reset_config() -> None:
+    """重置全局配置单例，下次 get_config() 调用时重新加载。测试用。"""
+    global _instance
+    _instance = None

@@ -112,6 +112,13 @@ class PolishRequest(BaseModel):
     stream: bool = False
 
 
+# ── PDF 接口 ──────────────────────────────────────────────────────────────────
+
+class PdfUrlRequest(BaseModel):
+    url: str
+    lang_out: str = "zh"
+
+
 # ── 录音控制 ──────────────────────────────────────────────────────────────────
 
 class RecordStartResponse(BaseModel):

@@ -677,8 +677,9 @@ def main():
                           choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     p_server.add_argument("--digest-interval", dest="digest_interval", type=int, default=3600,
                           help="日报定时间隔（秒），默认 3600，测试时可改小如 30")
-    p_server.add_argument("--menubar", action="store_true", default=False,
-                          help="同时显示 macOS 菜单栏图标（含打开界面、退出）")
+    p_server.add_argument("--no-menubar", dest="menubar", action="store_false",
+                          help="禁用 macOS 菜单栏图标")
+    p_server.set_defaults(menubar=True)
     p_server.set_defaults(func=cmd_server)
 
     # ── lumina stop ───────────────────────────────────────────────────────────

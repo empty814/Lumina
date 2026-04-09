@@ -16,10 +16,11 @@
   "port": 31821,
   "log_level": "INFO",
   "digest": {
-    "_readme": "scan_dirs 为空时使用默认目录（~/Documents, ~/Desktop 等）",
+    "_readme": "scan_dirs 为空时使用默认目录（~/Documents, ~/Desktop 等）；enabled_collectors 为 null 时全部启用，填列表可按需禁用某个来源，可选值：collect_shell_history / collect_git_logs / collect_clipboard / collect_browser_history / collect_calendar / collect_notes_app / collect_markdown_notes / collect_ai_queries",
     "scan_dirs": [],
     "history_hours": 24,
-    "refresh_hours": 1
+    "refresh_hours": 1,
+    "enabled_collectors": null
   },
   "system_prompts": {
     "translate_to_zh": "You are a professional translator. Translate the user's text into Simplified Chinese. Output only the translated text, no explanations.",

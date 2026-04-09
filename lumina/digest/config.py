@@ -4,7 +4,7 @@ lumina/digest/config.py — DigestConfig 及全局配置单例
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 
 @dataclass
@@ -20,6 +20,7 @@ class DigestConfig:
     history_hours: float = 24.0   # 采集窗口（小时）
     refresh_hours: float = 1.0    # 每隔多久检查一次增量
     notify_time: str = "20:00"    # 每日通知时间，格式 "HH:MM"，空字符串表示禁用
+    enabled_collectors: Optional[List[str]] = None  # None = 全部启用
 
 
 _cfg: DigestConfig = DigestConfig()
@@ -49,4 +50,5 @@ def configure(data: dict) -> None:
         history_hours=float(d.get("history_hours", 24.0)),
         refresh_hours=float(d.get("refresh_hours", 1.0)),
         notify_time=str(d.get("notify_time", "20:00")),
+        enabled_collectors=d.get("enabled_collectors", None),
     )

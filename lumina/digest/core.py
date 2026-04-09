@@ -90,10 +90,15 @@ async def _collect_all(since_ts: Optional[float] = None) -> str:
     cursors["_fallback"] = time.time() - effective_hours * 3600
     _collectors_mod._CURSORS = cursors          # 线程启动前写入，collector 只读
 
+    active = _COLLECTORS
+    if cfg.enabled_collectors is not None:
+        enabled_set = set(cfg.enabled_collectors)
+        active = [fn for fn in _COLLECTORS if fn.__name__ in enabled_set]
+
     loop = asyncio.get_running_loop()
     with override_history_hours(effective_hours):
-        with ThreadPoolExecutor(max_workers=len(_COLLECTORS)) as executor:
-            futures = [loop.run_in_executor(executor, fn) for fn in _COLLECTORS]
+        with ThreadPoolExecutor(max_workers=max(len(active), 1)) as executor:
+            futures = [loop.run_in_executor(executor, fn) for fn in active]
             results = await asyncio.gather(*futures, return_exceptions=True)
 
     # ── 保存 collector 写回的 cursor（去掉内部哨兵 key）─────────────────────
@@ -103,7 +108,7 @@ async def _collect_all(since_ts: Optional[float] = None) -> str:
 
     cache = {}
     sections = []
-    for fn, r in zip(_COLLECTORS, results):
+    for fn, r in zip(active, results):
         name = fn.__name__
         if isinstance(r, Exception):
             import traceback

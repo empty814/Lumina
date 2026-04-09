@@ -29,6 +29,7 @@ from lumina.api.protocol import (
     ChatMessage,
     ModelCard,
     ModelList,
+    PdfUrlRequest,
     RecordStopRequest,
     PolishRequest,
     SummarizeRequest,
@@ -54,8 +55,15 @@ _STATIC_DIR = (
 
 
 
+try:
+    from importlib.metadata import version as _pkg_version
+    _LUMINA_VERSION = _pkg_version("lumina")
+except Exception:
+    _LUMINA_VERSION = "0.3.0"
+
+
 def create_app(llm: LLMEngine, transcriber: Transcriber) -> FastAPI:
-    app = FastAPI(title="Lumina", version="0.1.0")
+    app = FastAPI(title="Lumina", version=_LUMINA_VERSION)
 
     app.add_middleware(
         CORSMiddleware,
@@ -127,7 +135,10 @@ def create_app(llm: LLMEngine, transcriber: Transcriber) -> FastAPI:
         except Exception as e:
             _pdf_jobs[job_id].update({"status": "error", "error": str(e)})
         finally:
-            # 1 小时后清理 job 记录，防止内存无限增长
+            # 300 秒后删临时目录（给用户时间下载），1 小时后清理 job 记录
+            tmp_dir = _pdf_jobs.get(job_id, {}).get("dir")
+            if tmp_dir:
+                _asyncio.create_task(_delayed_rmtree(tmp_dir, delay=300))
             await _asyncio.sleep(3600)
             _pdf_jobs.pop(job_id, None)
 
@@ -159,10 +170,10 @@ def create_app(llm: LLMEngine, transcriber: Transcriber) -> FastAPI:
         return {"job_id": job_id}
 
     @app.post("/v1/pdf/url")
-    async def pdf_from_url(body: dict):
+    async def pdf_from_url(body: PdfUrlRequest):
         """从 URL 下载 PDF（命中缓存则跳过下载）→ 翻译，返回 job_id。"""
-        url = body.get("url", "").strip()
-        lang_out = body.get("lang_out", "zh")
+        url = body.url.strip()
+        lang_out = body.lang_out
         if not url:
             raise HTTPException(400, "url 不能为空")
         try:
@@ -210,9 +221,9 @@ def create_app(llm: LLMEngine, transcriber: Transcriber) -> FastAPI:
         )
 
     @app.post("/v1/pdf/url_stream")
-    async def pdf_url_stream(body: dict):
+    async def pdf_url_stream(body: PdfUrlRequest):
         """从 URL 下载 PDF（命中缓存则跳过下载）→ 流式摘要（SSE）。"""
-        url = body.get("url", "").strip()
+        url = body.url.strip()
         if not url:
             raise HTTPException(400, "url 不能为空")
         try:
@@ -435,7 +446,7 @@ def create_app(llm: LLMEngine, transcriber: Transcriber) -> FastAPI:
 
 
 def _cleanup_after(tmp_dir: str, delay: int = 30):
-    """返回 BackgroundTask：延迟删除临时目录。"""
+    """返回 BackgroundTask：延迟删除临时目录（流式响应结束后挂载）。"""
     from starlette.background import BackgroundTask
 
     async def _do():
@@ -443,6 +454,12 @@ def _cleanup_after(tmp_dir: str, delay: int = 30):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     return BackgroundTask(_do)
+
+
+async def _delayed_rmtree(path: str, delay: int = 300):
+    """延迟删除临时目录（在 asyncio 协程内使用）。"""
+    await asyncio.sleep(delay)
+    shutil.rmtree(path, ignore_errors=True)
 
 
 async def raw_request_disconnected(request) -> bool:
