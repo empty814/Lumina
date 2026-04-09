@@ -257,6 +257,7 @@ def cmd_server(args):
     _env_interval = int(os.environ.get("LUMINA_DIGEST_INTERVAL", 3600))
     digest_interval = getattr(args, "digest_interval", _env_interval)
     _start_digest_timer(llm, interval=digest_interval)
+    _start_daily_notify_timer()
 
     if _EDITION in ("full", "lite"):
         _run_with_menubar(fastapi_app, cfg, llm)
@@ -299,6 +300,54 @@ def _start_digest_timer(llm, interval: int = 3600):
     t.daemon = True
     t.start()
     logger.info("Digest timer started, next trigger in %.0fs (interval=%ds)", delay, interval)
+
+
+def _start_daily_notify_timer():
+    """每天在 config.digest.notify_time（默认 20:00）发送今日日报通知。"""
+    import threading
+    import time
+    from lumina.digest.config import get_cfg
+
+    def _seconds_to_next_notify(notify_time: str) -> float:
+        try:
+            hour, minute = map(int, notify_time.split(":"))
+        except Exception:
+            return -1  # 格式错误，禁用
+        now = time.time()
+        import datetime
+        today = datetime.date.today()
+        target = datetime.datetime(today.year, today.month, today.day, hour, minute)
+        target_ts = target.timestamp()
+        if target_ts <= now:
+            # 今天已过，等到明天
+            target_ts += 86400
+        return target_ts - now
+
+    def _fire():
+        from lumina.digest.core import load_digest
+        digest = load_digest() or ""
+        # 取第一条日报的标题行作为通知摘要
+        lines = [l.strip() for l in digest.splitlines() if l.strip() and not l.startswith("<!--")]
+        summary = next((l.lstrip("#").strip() for l in lines if l.startswith("#")), "今日日报已生成")
+        _notify("Lumina 日报", summary[:60])
+        # 24 小时后再次触发
+        t = threading.Timer(86400, _fire)
+        t.daemon = True
+        t.start()
+
+    notify_time = get_cfg().notify_time
+    if not notify_time:
+        return  # 空字符串表示禁用
+    delay = _seconds_to_next_notify(notify_time)
+    if delay < 0:
+        logger.warning("Daily notify: invalid notify_time %r, skipping", notify_time)
+        return
+    t = threading.Timer(delay, _fire)
+    t.daemon = True
+    t.start()
+    import datetime
+    fire_at = (datetime.datetime.now() + datetime.timedelta(seconds=delay)).strftime("%H:%M")
+    logger.info("Daily notify timer started, first trigger at %s", fire_at)
 
 
 def _run_with_menubar(fastapi_app, cfg, llm):

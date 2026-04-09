@@ -19,6 +19,7 @@ class DigestConfig:
     ])
     history_hours: float = 24.0   # 采集窗口（小时）
     refresh_hours: float = 1.0    # 每隔多久检查一次增量
+    notify_time: str = "20:00"    # 每日通知时间，格式 "HH:MM"，空字符串表示禁用
 
 
 _cfg: DigestConfig = DigestConfig()
@@ -47,4 +48,5 @@ def configure(data: dict) -> None:
         scan_dirs=d.get("scan_dirs") or DigestConfig().scan_dirs,
         history_hours=float(d.get("history_hours", 24.0)),
         refresh_hours=float(d.get("refresh_hours", 1.0)),
+        notify_time=str(d.get("notify_time", "20:00")),
     )

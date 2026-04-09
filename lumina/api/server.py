@@ -417,6 +417,20 @@ def create_app(llm: LLMEngine, transcriber: Transcriber) -> FastAPI:
         from lumina.digest.core import get_debug_info
         return get_debug_info()
 
+    @app.get("/v1/digest/export")
+    async def digest_export_api():
+        """下载完整 digest.md 文件。"""
+        from lumina.digest import load_digest
+        from fastapi.responses import Response
+        from datetime import datetime
+        content = load_digest() or ""
+        filename = f"lumina-digest-{datetime.now().strftime('%Y%m%d')}.md"
+        return Response(
+            content=content.encode("utf-8"),
+            media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
     return app
 
 

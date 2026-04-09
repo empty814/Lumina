@@ -219,11 +219,49 @@
                   @click="digest.allExpanded = !digest.allExpanded; digest.sections.forEach((s,i) => s.open = digest.allExpanded || i === 0)"
                   x-text="digest.allExpanded ? '收起全部' : '展开全部'"></button>
               </template>
+              <a class="opt-btn" style="padding:5px 12px;font-size:12px;text-decoration:none;"
+                href="/v1/digest/export" download>导出</a>
               <button class="opt-btn selected" style="padding:5px 12px;font-size:13px;font-weight:600;"
                 :disabled="digest.generating"
                 @click="triggerGenerate()"
                 x-text="digest.generating ? '生成中…' : '立即生成'"></button>
             </div>
+          </div>
+        </div>
+
+        <!-- 数据来源 -->
+        <div class="card" style="padding:0;overflow:hidden;">
+          <div style="width:100%;padding:14px 18px;cursor:pointer;display:flex;align-items:center;justify-content:space-between;font-size:13px;font-weight:600;color:var(--sub);"
+            @click="debug.open = !debug.open; debug.open && loadDebug()">
+            <span>数据来源</span>
+            <span style="transition:transform .2s;" :style="debug.open ? 'transform:rotate(90deg)' : ''">▶</span>
+          </div>
+          <div x-show="debug.open" style="padding:0 18px 16px;display:none;" x-transition>
+            <template x-if="debug.loading">
+              <p style="color:var(--sub);font-size:13px;">加载中…</p>
+            </template>
+            <template x-for="(info, key) in debug.collectors" :key="key">
+              <details class="debug-section">
+                <summary class="debug-summary">
+                  <span :style="info.error ? 'color:var(--danger)' : info.permission_denied ? 'color:var(--warn,#f59e0b)' : info.chars > 0 ? 'color:var(--success)' : 'color:var(--sub)'">●</span>
+                  <span x-text="debug.names[key] || key"></span>
+                  <span style="color:var(--sub);font-size:12px;" x-text="info.error ? info.error.split('\n').pop() : info.permission_denied ? '需要授权' : info.chars > 0 ? info.lines + ' 行 / ' + info.chars + ' 字' : '空'"></span>
+                </summary>
+                <template x-if="info.permission_denied">
+                  <div style="padding:8px 0 4px;font-size:13px;line-height:1.6;">
+                    <span style="color:var(--warn,#f59e0b);">⚠ 权限不足，无法读取备忘录。</span><br>
+                    请前往 <strong>系统设置 → 隐私与安全 → 完整磁盘访问</strong>，<br>
+                    将 <strong>Lumina</strong> 添加到列表并开启，然后重启 Lumina 即可。
+                  </div>
+                </template>
+                <template x-if="info.preview && !info.permission_denied">
+                  <pre class="debug-pre" x-text="info.preview"></pre>
+                </template>
+                <template x-if="info.error && !info.preview">
+                  <pre class="debug-pre" style="color:var(--danger);" x-text="info.error"></pre>
+                </template>
+              </details>
+            </template>
           </div>
         </div>
 
@@ -266,46 +304,6 @@
             <p style="color:var(--sub);font-size:14px;">暂无摘要，点击「立即生成」生成。</p>
           </div>
         </template>
-
-        <!-- 数据来源 -->
-        <div class="card" style="padding:0;overflow:hidden;">
-          <div style="width:100%;padding:14px 18px;cursor:pointer;display:flex;align-items:center;justify-content:space-between;font-size:13px;font-weight:600;color:var(--sub);"
-            @click="debug.open = !debug.open; debug.open && loadDebug()">
-            <span>数据来源</span>
-            <span style="transition:transform .2s;" :style="debug.open ? 'transform:rotate(90deg)' : ''">▶</span>
-          </div>
-          <div x-show="debug.open" style="padding:0 18px 16px;display:none;" x-transition>
-            <template x-if="debug.loading">
-              <p style="color:var(--sub);font-size:13px;">加载中…</p>
-            </template>
-            <template x-if="!debug.loading && debug.activityCheck">
-              <p style="font-size:12px;color:var(--sub);margin-bottom:12px;"
-                x-text="(debug.activityCheck.has_new ? '有新活动' : '无新活动，跳过生成') + ' · 检测于 ' + debug.activityCheck.time"></p>
-            </template>
-            <template x-for="(info, key) in debug.collectors" :key="key">
-              <details class="debug-section">
-                <summary class="debug-summary">
-                  <span :style="info.error ? 'color:var(--danger)' : info.permission_denied ? 'color:var(--warn,#f59e0b)' : info.chars > 0 ? 'color:var(--success)' : 'color:var(--sub)'">●</span>
-                  <span x-text="debug.names[key] || key"></span>
-                  <span style="color:var(--sub);font-size:12px;" x-text="info.error ? info.error.split('\n').pop() : info.permission_denied ? '需要授权' : info.chars > 0 ? info.lines + ' 行 / ' + info.chars + ' 字' : '空'"></span>
-                </summary>
-                <template x-if="info.permission_denied">
-                  <div style="padding:8px 0 4px;font-size:13px;line-height:1.6;">
-                    <span style="color:var(--warn,#f59e0b);">⚠ 权限不足，无法读取备忘录。</span><br>
-                    请前往 <strong>系统设置 → 隐私与安全 → 完整磁盘访问</strong>，<br>
-                    将 <strong>Lumina</strong> 添加到列表并开启，然后重启 Lumina 即可。
-                  </div>
-                </template>
-                <template x-if="info.preview && !info.permission_denied">
-                  <pre class="debug-pre" x-text="info.preview"></pre>
-                </template>
-                <template x-if="info.error && !info.preview">
-                  <pre class="debug-pre" style="color:var(--danger);" x-text="info.error"></pre>
-                </template>
-              </details>
-            </template>
-          </div>
-        </div>
 
       </div>
     </template>
@@ -451,13 +449,14 @@ function luminaApp() {
     // ── Debug ──
     debug: {
       open: false, loading: false,
-      activityCheck: null, collectors: {},
+      collectors: {},
       names: {
         collect_shell_history:   '终端历史',
         collect_git_logs:        'Git 提交',
         collect_clipboard:       '剪贴板',
         collect_browser_history: '浏览器历史',
         collect_notes_app:       '备忘录',
+        collect_calendar:        '日历',
         collect_markdown_notes:  'Markdown 笔记',
         collect_ai_queries:      'AI 提问',
       },
@@ -549,7 +548,6 @@ function luminaApp() {
         const res = await fetch('/v1/digest/debug');
         if (!res.ok) throw new Error(res.statusText);
         const data = await res.json();
-        this.debug.activityCheck = data.activity_check || null;
         this.debug.collectors = data.collectors || {};
       } catch(e) {
         // ignore

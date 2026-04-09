@@ -18,6 +18,7 @@ from lumina.digest.collectors import (
     collect_clipboard,
     collect_browser_history,
     collect_notes_app,
+    collect_calendar,
     collect_markdown_notes,
     collect_ai_queries,
 )
@@ -43,6 +44,7 @@ _COLLECTORS = [
     collect_git_logs,
     collect_clipboard,
     collect_browser_history,
+    collect_calendar,
     collect_notes_app,
     collect_markdown_notes,
     collect_ai_queries,
