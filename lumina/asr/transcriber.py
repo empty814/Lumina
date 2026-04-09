@@ -39,6 +39,7 @@ class Transcriber:
             path_or_hf_repo=self.model,
             language=language,
             fp16=False,
+            condition_on_previous_text=False,  # PTT 每次独立录音，不应带上次上下文
         )
         return result.get("text", "").strip()
 
