@@ -17,7 +17,7 @@ import numpy as np
 import sounddevice as sd
 from pynput import keyboard as kb
 
-SAMPLE_RATE = 16000
+WHISPER_RATE = 16000   # Whisper 要求的采样率
 
 
 # ── 系统剪贴板 / 粘贴 ──────────────────────────────────────────────────────────
@@ -109,6 +109,7 @@ class PTTDaemon:
         self._recording = False
         self._frames: list = []
         self._stream = None
+        self._device_rate: int = WHISPER_RATE   # 录音时实际采样率，启动时确定
         self._lock = threading.Lock()
         self._listener = None   # 当前 pynput listener，stop() 时用
 
@@ -132,13 +133,17 @@ class PTTDaemon:
             self._frames = []
 
         try:
+            # 用设备原生采样率录音，避免 sounddevice 低质量重采样
+            device_info = sd.query_devices(kind="input")
+            device_rate = int(device_info["default_samplerate"])
             stream = sd.InputStream(
-                samplerate=SAMPLE_RATE, channels=1, dtype="int16",
+                samplerate=device_rate, channels=1, dtype="float32",
                 callback=self._audio_callback,
             )
             stream.start()
             with self._lock:
                 self._stream = stream
+                self._device_rate = device_rate
         except Exception as e:
             print(f"✗ 开始录音失败：{e}", flush=True)
             with self._lock:
@@ -179,7 +184,9 @@ class PTTDaemon:
             self._set_menubar(self._menubar_title)
             return
 
-        wav_bytes = self._frames_to_wav(frames)
+        with self._lock:
+            device_rate = self._device_rate
+        wav_bytes = self._frames_to_wav(frames, device_rate)
         threading.Thread(target=self._transcribe_and_paste, args=(wav_bytes,), daemon=True).start()
 
     def _watchdog(self, timeout: int = 30):
@@ -195,14 +202,26 @@ class PTTDaemon:
     # ── 转写 ──────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _frames_to_wav(frames: list) -> bytes:
-        audio = np.concatenate(frames, axis=0)
+    def _frames_to_wav(frames: list, device_rate: int) -> bytes:
+        audio = np.concatenate(frames, axis=0).flatten()  # float32
+
+        # 如果设备采样率不是 16000，resample 到 Whisper 要求的 16000Hz
+        # 用 scipy.signal.resample_poly：带低通滤波的高质量重采样，防止混叠
+        if device_rate != WHISPER_RATE:
+            from math import gcd
+            from scipy.signal import resample_poly
+            g = gcd(WHISPER_RATE, device_rate)
+            audio = resample_poly(audio, WHISPER_RATE // g, device_rate // g).astype(np.float32)
+
+        # float32 → int16
+        audio_int16 = (audio * 32767).clip(-32768, 32767).astype(np.int16)
+
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
             wf.setnchannels(1)
-            wf.setsampwidth(2)   # int16 = 2 bytes
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(audio.tobytes())
+            wf.setsampwidth(2)
+            wf.setframerate(WHISPER_RATE)
+            wf.writeframes(audio_int16.tobytes())
         return buf.getvalue()
 
     def _transcribe_and_paste(self, wav_bytes: bytes):
@@ -220,7 +239,7 @@ class PTTDaemon:
 
         print(f"✓ {text}", flush=True)
         _pbcopy(text)
-        time.sleep(0.15)   # 等修饰键完全松开，避免 Cmd+V 被系统拦截
+        time.sleep(0.3)   # 等热键修饰键完全松开，避免 Cmd+V 被系统截断
         _paste()
         print("✓ 已粘贴", flush=True)
 
@@ -282,18 +301,34 @@ class PTTDaemon:
             self._run_toggle_single(parsed)
 
     def _run_toggle_single(self, target_key):
-        """单键 toggle：on_press 切换状态，含消抖和权限检查。"""
+        """单键 toggle：on_release 切换状态，含消抖和权限检查。
+
+        用 on_release 而非 on_press：
+        - 修饰键（cmd/ctrl/alt）在组合键（cmd+c 等）中按下后会先触发其他键的
+          on_press，松开修饰键时才触发 on_release，避免组合键误触发 PTT。
+        - 普通键（f5/caps_lock）on_release 同样工作正常。
+        """
         _received_event = threading.Event()
-        _last_press_time = [0.0]
+        _other_key_pressed = [False]   # 本次 press 期间是否同时按了其他键
+        _last_trigger_time = [0.0]
 
         def on_press(key):
             _received_event.set()
+            if key == target_key:
+                _other_key_pressed[0] = False  # 重置，开始跟踪本次按键
+            else:
+                _other_key_pressed[0] = True   # 有其他键同时按下（组合键）
+
+        def on_release(key):
             if key != target_key:
                 return
-            now = time.time()
-            if now - _last_press_time[0] < 0.3:   # 消抖，过滤 auto-repeat
+            # 组合键（cmd+v 等）中松开 cmd，不触发
+            if _other_key_pressed[0]:
                 return
-            _last_press_time[0] = now
+            now = time.time()
+            if now - _last_trigger_time[0] < 0.3:   # 消抖
+                return
+            _last_trigger_time[0] = now
             with self._lock:
                 recording = self._recording
             if recording:
@@ -312,7 +347,7 @@ class PTTDaemon:
 
         threading.Thread(target=_permission_check, daemon=True).start()
 
-        with kb.Listener(on_press=on_press) as listener:
+        with kb.Listener(on_press=on_press, on_release=on_release) as listener:
             self._listener = listener
             listener.join()
         self._listener = None
