@@ -259,7 +259,7 @@ def cmd_server(args):
     _start_digest_timer(llm, interval=digest_interval)
     _start_daily_notify_timer()
 
-    if _EDITION in ("full", "lite"):
+    if _EDITION in ("full", "lite") or getattr(args, "menubar", False):
         _run_with_menubar(fastapi_app, cfg, llm)
     else:
         try:
@@ -677,6 +677,8 @@ def main():
                           choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     p_server.add_argument("--digest-interval", dest="digest_interval", type=int, default=3600,
                           help="日报定时间隔（秒），默认 3600，测试时可改小如 30")
+    p_server.add_argument("--menubar", action="store_true", default=False,
+                          help="同时显示 macOS 菜单栏图标（含打开界面、退出）")
     p_server.set_defaults(func=cmd_server)
 
     # ── lumina stop ───────────────────────────────────────────────────────────
