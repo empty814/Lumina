@@ -12,9 +12,9 @@ provider.openai      type=openai 时必填：
 whisper_model        Whisper ASR 模型 ID
 host / port          HTTP 服务监听地址与端口（默认 127.0.0.1:31821）
 log_level            日志级别：DEBUG / INFO / WARNING / ERROR
-digest               日报采集配置（scan_dirs / history_hours / refresh_hours）
+digest               日报配置（enabled / scan_dirs / history_hours / refresh_hours）
 system_prompts       各任务的 system prompt，可按需覆盖
-ptt                  PTT 热键配置（hotkey / language）
+ptt                  PTT 配置（enabled / hotkey / language）
 
 环境变量优先级高于 config.json，可用于临时覆盖：
   LUMINA_PROVIDER_TYPE / LUMINA_MODEL_PATH
@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 _CONFIG_PATH = Path(__file__).parent / "config.json"
-_DEFAULT_MODEL = str(Path(__file__).parent.parent / "models" / "qwen3.5-0.8b-4bit")
+_DEFAULT_MODEL = str(Path.home() / ".lumina" / "models" / "qwen3.5-0.8b-4bit")
 
 
 @dataclass
@@ -40,6 +40,7 @@ class OpenAIProviderConfig:
 
 @dataclass
 class PttConfig:
+    enabled: bool = False
     hotkey: str = "f5"
     language: Optional[str] = "zh"   # None = Whisper 自动检测
 
@@ -95,6 +96,7 @@ class Config:
         # ── PTT ───────────────────────────────────────────────────────────────
         pt = data.get("ptt", {})
         self.ptt = PttConfig(
+            enabled=bool(pt.get("enabled", False)),
             hotkey=pt.get("hotkey", "f5"),
             language=pt.get("language", "zh") or None,
         )

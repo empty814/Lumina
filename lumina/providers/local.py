@@ -18,10 +18,14 @@ LocalProvider：使用本地 mlx-lm 模型进行推理（默认 Provider）。
     - 效果：TTFT(B) ≈ prefill(A) + 1 step，而非等 A 全部完成
 """
 import asyncio
+import inspect
+import logging
+import os
 import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, AsyncIterator, List, Optional
 import uuid
 
@@ -40,6 +44,10 @@ _SYSTEM_PROMPT_SENTINEL = "<lumina_system_cache_user_probe_7a93d1e4>"
 _WARMUP_SYSTEM_PROMPT = "You are a helpful assistant."
 _WARMUP_USER_PROMPT = "Reply with one short word."
 _WARMUP_DECODE_STEPS = 4
+_DEFAULT_MODEL_REPO_ID = "mlx-community/Qwen3.5-0.8B-4bit"
+_DEFAULT_MODEL_DIRNAME = "qwen3.5-0.8b-4bit"
+
+logger = logging.getLogger("lumina")
 
 
 @dataclass
@@ -101,11 +109,77 @@ class LocalProvider(BaseProvider):
         self._batch_slots: dict[int, _RequestSlot] = {}
         self._batch_executor: Optional[ThreadPoolExecutor] = None
         self._system_prompt_cache: OrderedDict[str, _SystemPromptCacheEntry] = OrderedDict()
+        self._supports_enable_thinking: Optional[bool] = None
 
     # ── 生命周期 ──────────────────────────────────────────────────────────────
 
+    def _hf_hub_cache_dir(self) -> Path:
+        hub_cache = os.environ.get("HUGGINGFACE_HUB_CACHE")
+        if hub_cache:
+            return Path(hub_cache).expanduser()
+        hf_home = os.environ.get("HF_HOME")
+        if hf_home:
+            return Path(hf_home).expanduser() / "hub"
+        return Path.home() / ".cache" / "huggingface" / "hub"
+
+    def _find_cached_repo_snapshot(self, repo_id: str) -> Optional[str]:
+        repo_cache_dir = self._hf_hub_cache_dir() / f"models--{repo_id.replace('/', '--')}" / "snapshots"
+        if not repo_cache_dir.exists():
+            return None
+
+        candidates = [p for p in repo_cache_dir.iterdir() if p.is_dir()]
+        if not candidates:
+            return None
+
+        # 优先返回最近访问/修改的快照目录。
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        for snapshot_dir in candidates:
+            if any(snapshot_dir.glob("*.safetensors")):
+                return str(snapshot_dir)
+        return None
+
+    def _resolve_load_target(self) -> str:
+        raw_target = (self.model_path or "").strip()
+        if not raw_target:
+            cached = self._find_cached_repo_snapshot(_DEFAULT_MODEL_REPO_ID)
+            if cached:
+                logger.info("Use cached model snapshot: %s", cached)
+                return cached
+            return _DEFAULT_MODEL_REPO_ID
+
+        expanded = Path(raw_target).expanduser()
+        # 目录已存在：按本地模型目录加载。
+        if expanded.exists():
+            return str(expanded)
+
+        # 不存在的本地路径不能直接传给 mlx_lm.load（会被当作 repo id 并校验失败）。
+        is_path_like = (
+            expanded.is_absolute()
+            or raw_target.startswith(("~", ".", ".."))
+            or os.path.sep in raw_target
+            or (os.path.altsep and os.path.altsep in raw_target)
+        )
+        if is_path_like and expanded.name.lower() == _DEFAULT_MODEL_DIRNAME:
+            cached = self._find_cached_repo_snapshot(_DEFAULT_MODEL_REPO_ID)
+            if cached:
+                logger.info(
+                    "Local model path missing, use cached snapshot: %s -> %s",
+                    expanded,
+                    cached,
+                )
+                return cached
+            logger.info(
+                "Local model path not found, fallback to repo id download: %s -> %s",
+                expanded,
+                _DEFAULT_MODEL_REPO_ID,
+            )
+            return _DEFAULT_MODEL_REPO_ID
+
+        return raw_target
+
     def load(self):
-        self._model, self._tokenizer = load(self.model_path)
+        load_target = self._resolve_load_target()
+        self._model, self._tokenizer = load(load_target)
         mx.eval(self._model.parameters())
         self._init_batch_engine()
         self._maybe_run_warmup()
@@ -153,9 +227,20 @@ class LocalProvider(BaseProvider):
             {"role": "system", "content": system},
             {"role": "user", "content": user_text},
         ]
-        return self._tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+        }
+        if self._supports_enable_thinking is None:
+            try:
+                sig = inspect.signature(self._tokenizer.apply_chat_template)
+                self._supports_enable_thinking = "enable_thinking" in sig.parameters
+            except (TypeError, ValueError):
+                self._supports_enable_thinking = False
+        if self._supports_enable_thinking:
+            kwargs["enable_thinking"] = False
+
+        return self._tokenizer.apply_chat_template(messages, **kwargs)
 
     def _should_run_warmup(self) -> bool:
         return self.enable_warmup
@@ -576,7 +661,11 @@ class LocalProvider(BaseProvider):
         """使用 mlx-lm BatchGenerator 作为默认 batch engine。"""
         try:
             while True:
-                if self._prefill_queue.empty() and not self._batch_slots and not self._batch_generator.unprocessed_prompts:
+                if (
+                    self._prefill_queue.empty()
+                    and not self._batch_slots
+                    and not self._batch_generator_has_unprocessed_prompts()
+                ):
                     self._not_empty.clear()
                     await self._not_empty.wait()
 
@@ -607,32 +696,113 @@ class LocalProvider(BaseProvider):
                         slot.sampler = sampler
                         self._batch_slots[uid] = slot
 
-                if not self._batch_slots and not self._batch_generator.unprocessed_prompts:
+                if (
+                    not self._batch_slots
+                    and not self._batch_generator_has_unprocessed_prompts()
+                ):
                     continue
 
                 if self._batch_executor is not None:
                     responses = await asyncio.get_running_loop().run_in_executor(self._batch_executor, self._batch_generator.next)
                 else:
                     responses = await asyncio.get_running_loop().run_in_executor(None, self._batch_generator.next)
-                for response in responses:
-                    slot = self._batch_slots.get(response.uid)
+                generation_responses = self._extract_generation_responses(responses)
+                for response in self._iter_batch_responses(generation_responses):
+                    uid = self._response_uid(response)
+                    if uid is None:
+                        continue
+                    slot = self._batch_slots.get(uid)
                     if slot is None:
                         continue
 
-                    if response.finish_reason != "stop":
-                        self._emit_token_id_local(slot, int(response.token))
+                    finish_reason = self._response_finish_reason(response)
+                    token = self._response_token(response)
+                    if finish_reason != "stop" and token is not None:
+                        self._emit_token_id_local(slot, token)
 
-                    if response.finish_reason is not None:
+                    if finish_reason is not None:
                         slot.done = True
-                        if response.finish_reason == "stop":
+                        if finish_reason == "stop":
                             self._put_token_local(slot, None)
-                        self._batch_slots.pop(response.uid, None)
+                        self._batch_slots.pop(uid, None)
         finally:
             if self._batch_generator is not None:
                 self._batch_generator.close()
             if self._batch_executor is not None:
                 self._batch_executor.shutdown(wait=False, cancel_futures=False)
                 self._batch_executor = None
+
+    def _extract_generation_responses(self, responses: Any) -> Any:
+        """
+        兼容 mlx-lm 0.31.x: next() 返回 (prompt_responses, generation_responses)。
+        仅处理 generation_responses，避免在高并发下无效遍历 prompt 进度响应。
+        """
+        if isinstance(responses, tuple) and len(responses) == 2:
+            return responses[1]
+        return responses
+
+    def _iter_batch_responses(self, responses: Any):
+        """兼容 mlx-lm 不同版本 next() 返回结构（list / 嵌套 list / tuple）。"""
+        if responses is None:
+            return
+        stack = [responses]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, (list, tuple)):
+                stack.extend(reversed(item))
+                continue
+            yield item
+
+    def _batch_generator_has_unprocessed_prompts(self) -> bool:
+        """兼容不同 mlx-lm 版本的 pending prompts 字段。"""
+        if self._batch_generator is None:
+            return False
+
+        bg = self._batch_generator
+        for attr in (
+            "unprocessed_prompts",
+            "_unprocessed_prompts",
+            "pending_prompts",
+            "_pending_prompts",
+        ):
+            if not hasattr(bg, attr):
+                continue
+            value = getattr(bg, attr)
+            try:
+                return len(value) > 0
+            except Exception:
+                return bool(value)
+
+        count = getattr(bg, "num_unprocessed_prompts", 0)
+        try:
+            return int(count) > 0
+        except Exception:
+            return bool(count)
+
+    def _response_uid(self, response: Any) -> Optional[int]:
+        if hasattr(response, "uid"):
+            return getattr(response, "uid")
+        if isinstance(response, dict):
+            return response.get("uid")
+        return None
+
+    def _response_finish_reason(self, response: Any):
+        if hasattr(response, "finish_reason"):
+            return getattr(response, "finish_reason")
+        if isinstance(response, dict):
+            return response.get("finish_reason")
+        return None
+
+    def _response_token(self, response: Any) -> Optional[int]:
+        if hasattr(response, "token"):
+            token = getattr(response, "token")
+        elif isinstance(response, dict):
+            token = response.get("token")
+        else:
+            return None
+        if token is None:
+            return None
+        return int(token)
 
     def _emit_token_id_local(self, slot: _RequestSlot, token_id: int) -> None:
         slot._token_ids.append(token_id)
