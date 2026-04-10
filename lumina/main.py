@@ -481,16 +481,21 @@ def _start_ptt(cfg, menubar_app=None):
                 continue
 
             print(f"PTT 热键更新：{last_hotkey.upper()} → {new_hotkey.upper()}", flush=True)
-            # 停旧
+            # 停旧（保留暂停状态）
+            paused = _current_ptt[0].paused if _current_ptt else False
             if _current_ptt:
                 _current_ptt[0].stop()
                 _current_ptt.clear()
             # 启新
-            _current_ptt.append(_make_ptt(new_hotkey, new_language))
+            new_ptt = _make_ptt(new_hotkey, new_language)
+            if paused:
+                new_ptt.pause()
+            _current_ptt.append(new_ptt)
             last_hotkey   = new_hotkey
             last_language = new_language
 
     threading.Thread(target=_watcher, daemon=True).start()
+    return _current_ptt   # 供调用方拿到当前 daemon 引用
 
 
 def _run_with_menubar(fastapi_app, cfg, llm):
@@ -524,12 +529,18 @@ def _run_with_menubar(fastapi_app, cfg, llm):
     ]
     _icon_path = next((str(p) for p in _icon_candidates if p and p.exists()), None)
 
+    _PAUSE_LABEL  = "暂停语音识别"
+    _RESUME_LABEL = "恢复语音识别"
+
     class LuminaApp(rumps.App):
         def __init__(self):
             super().__init__(title, icon=_icon_path, quit_button=None, template=False)
+            self._ptt_ref: list = []   # _start_ptt 启动后写入
             self.menu = [
                 rumps.MenuItem("打开界面", callback=self._open_ui),
                 None,  # 分隔线
+                rumps.MenuItem(_PAUSE_LABEL, callback=self._toggle_ptt),
+                None,
                 rumps.MenuItem("重启服务", callback=self._restart),
                 rumps.MenuItem("退出 Lumina", callback=self._quit),
             ]
@@ -537,6 +548,17 @@ def _run_with_menubar(fastapi_app, cfg, llm):
         def _open_ui(self, _):
             import subprocess
             subprocess.Popen(["open", f"http://127.0.0.1:{cfg.port}"])
+
+        def _toggle_ptt(self, sender):
+            if not self._ptt_ref:
+                return
+            ptt = self._ptt_ref[0]
+            if ptt.paused:
+                ptt.resume()
+                sender.title = _PAUSE_LABEL
+            else:
+                ptt.pause()
+                sender.title = _RESUME_LABEL
 
         def _restart(self, _):
             server.should_exit = True
@@ -555,7 +577,8 @@ def _run_with_menubar(fastapi_app, cfg, llm):
 
     try:
         app = LuminaApp()
-        _start_ptt(cfg, menubar_app=app)
+        ptt_ref = _start_ptt(cfg, menubar_app=app)
+        app._ptt_ref = ptt_ref
         app.run()
     finally:
         server.should_exit = True

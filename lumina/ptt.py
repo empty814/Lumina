@@ -83,6 +83,8 @@ def _parse_key(key_str: str):
 class PTTDaemon:
     """
     Toggle 热键录音：按一次开始，再按一次停止，自动转写并粘贴。
+    ESC 取消：录音中按 ESC 丢弃音频，不转写不粘贴。
+    暂停：调用 pause()/resume() 暂停/恢复热键响应。
 
     Args:
         base_url:      Lumina 服务地址，如 http://127.0.0.1:31821
@@ -107,6 +109,7 @@ class PTTDaemon:
         self._menubar_title = menubar_title
 
         self._recording = False
+        self._paused = False        # 暂停时热键不响应
         self._frames: list = []
         self._stream = None
         self._device_rate: int = WHISPER_RATE   # 录音时实际采样率，启动时确定
@@ -188,6 +191,44 @@ class PTTDaemon:
             device_rate = self._device_rate
         wav_bytes = self._frames_to_wav(frames, device_rate)
         threading.Thread(target=self._transcribe_and_paste, args=(wav_bytes,), daemon=True).start()
+
+    def _cancel(self):
+        """取消录音：停止录音流，丢弃音频，不转写不粘贴。"""
+        with self._lock:
+            if not self._recording:
+                return
+            self._recording = False
+            stream = self._stream
+            self._stream = None
+            self._frames = []
+
+        if stream:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+
+        self._set_menubar(self._menubar_title)
+        print("✗ 已取消录音", flush=True)
+
+    def pause(self):
+        """暂停热键响应（正在录音时先取消）。"""
+        with self._lock:
+            self._paused = True
+        threading.Thread(target=self._cancel, daemon=True).start()
+        print("PTT 已暂停", flush=True)
+
+    def resume(self):
+        """恢复热键响应。"""
+        with self._lock:
+            self._paused = False
+        print("PTT 已恢复", flush=True)
+
+    @property
+    def paused(self) -> bool:
+        with self._lock:
+            return self._paused
 
     def _watchdog(self, timeout: int = 30):
         """超时保护：录音超过 timeout 秒自动停止。"""
@@ -314,6 +355,13 @@ class PTTDaemon:
 
         def on_press(key):
             _received_event.set()
+            # ESC 取消（录音中）
+            if key == kb.Key.esc:
+                with self._lock:
+                    recording = self._recording
+                if recording:
+                    threading.Thread(target=self._cancel, daemon=True).start()
+                return
             if key == target_key:
                 _other_key_pressed[0] = False  # 重置，开始跟踪本次按键
             else:
@@ -331,6 +379,9 @@ class PTTDaemon:
             _last_trigger_time[0] = now
             with self._lock:
                 recording = self._recording
+                paused = self._paused
+            if paused:
+                return
             if recording:
                 threading.Thread(target=self._stop, daemon=True).start()
             else:
@@ -353,16 +404,32 @@ class PTTDaemon:
         self._listener = None
 
     def _run_toggle_combo(self, hotkey_str: str):
-        """组合键 toggle：使用 GlobalHotKeys。"""
+        """组合键 toggle：使用 GlobalHotKeys。ESC 取消通过额外 Listener 监听。"""
         def on_activate():
             with self._lock:
                 recording = self._recording
+                paused = self._paused
+            if paused:
+                return
             if recording:
                 threading.Thread(target=self._stop, daemon=True).start()
             else:
                 threading.Thread(target=self._start, daemon=True).start()
 
+        def on_press(key):
+            if key == kb.Key.esc:
+                with self._lock:
+                    recording = self._recording
+                if recording:
+                    threading.Thread(target=self._cancel, daemon=True).start()
+
+        # GlobalHotKeys 不监听普通键，需要额外 Listener 捕获 ESC
+        esc_listener = kb.Listener(on_press=on_press)
+        esc_listener.daemon = True
+        esc_listener.start()
+
         with kb.GlobalHotKeys({hotkey_str: on_activate}) as h:
             self._listener = h
             h.join()
         self._listener = None
+        esc_listener.stop()
