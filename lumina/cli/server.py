@@ -446,7 +446,11 @@ def _run_with_menubar(fastapi_app, cfg, llm, config_path: str | None = None):
         if ptt_ref is not None:
             app._ptt_ref = ptt_ref
             app._refresh_ptt_menu_label()
+        logger.info("Menubar app starting event loop")
         app.run()
+        logger.info("Menubar app event loop returned (user quit or crashed)")
+    except Exception:
+        logger.exception("Menubar app crashed")
     finally:
         server.should_exit = True
         remove_pid()

@@ -169,6 +169,9 @@ class CollectorRunner:
                     "Digest: collector %s timed out after %ds", fn.__name__, self.TIMEOUT
                 )
                 return Exception(f"timeout after {self.TIMEOUT}s")
+            except Exception as e:
+                logger.warning("Digest: collector %s raised: %s", fn.__name__, e)
+                return e
 
         with override_history_hours(effective_hours):
             results = await asyncio.gather(*[_run_one(fn) for fn in collectors])
