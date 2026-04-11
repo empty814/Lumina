@@ -4,7 +4,6 @@ Digest 模块单元测试：config、cursor_store、collectors 的核心逻辑�
 """
 import json
 import os
-import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -22,11 +21,13 @@ def test_digest_config_defaults():
     assert cfg.refresh_hours == 1.0
     assert cfg.notify_time == "20:00"
     assert cfg.enabled_collectors is None
+    assert cfg.enabled is True
 
 
 def test_digest_config_configure():
     from lumina.digest.config import configure, get_cfg
     configure({"digest": {
+        "enabled": False,
         "history_hours": 12,
         "refresh_hours": 0.5,
         "notify_time": "09:00",
@@ -37,6 +38,7 @@ def test_digest_config_configure():
     assert cfg.refresh_hours == 0.5
     assert cfg.notify_time == "09:00"
     assert cfg.enabled_collectors == ["collect_shell_history", "collect_git_logs"]
+    assert cfg.enabled is False
 
 
 def test_digest_config_enabled_collectors_null():
@@ -195,7 +197,6 @@ def test_enabled_collectors_filters_active():
 
 def test_reset_config(tmp_path):
     from lumina.config import get_config, reset_config
-    import os
 
     # 写一个临时 config
     cfg_file = tmp_path / "config.json"
@@ -217,6 +218,79 @@ def test_reset_config(tmp_path):
     assert cfg2.port == 19999
 
     reset_config()  # 清理，不污染其他测试
+
+
+def test_config_defaults_model_path_to_user_cache_dir(tmp_path):
+    from lumina.config import get_config, reset_config
+
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(
+        json.dumps(
+            {
+                "provider": {"type": "local", "model_path": None, "openai": {}},
+                "host": "127.0.0.1",
+                "port": 19999,
+                "log_level": "INFO",
+                "digest": {},
+                "system_prompts": {},
+            }
+        )
+    )
+
+    reset_config()
+    cfg = get_config(str(cfg_file))
+    assert cfg.provider.model_path == str(
+        Path.home() / ".lumina" / "models" / "qwen3.5-0.8b-4bit"
+    )
+    reset_config()
+
+
+def test_config_respects_ptt_enabled_flag(tmp_path):
+    from lumina.config import get_config, reset_config
+
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(
+        json.dumps(
+            {
+                "provider": {"type": "local", "model_path": None, "openai": {}},
+                "host": "127.0.0.1",
+                "port": 19999,
+                "log_level": "INFO",
+                "digest": {},
+                "ptt": {"enabled": False, "hotkey": "f5", "language": "zh"},
+                "system_prompts": {},
+            }
+        )
+    )
+
+    reset_config()
+    cfg = get_config(str(cfg_file))
+    assert cfg.ptt.enabled is False
+    reset_config()
+
+
+def test_config_ptt_enabled_defaults_to_false_when_missing(tmp_path):
+    from lumina.config import get_config, reset_config
+
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(
+        json.dumps(
+            {
+                "provider": {"type": "local", "model_path": None, "openai": {}},
+                "host": "127.0.0.1",
+                "port": 19999,
+                "log_level": "INFO",
+                "digest": {},
+                "ptt": {"hotkey": "f5", "language": "zh"},
+                "system_prompts": {},
+            }
+        )
+    )
+
+    reset_config()
+    cfg = get_config(str(cfg_file))
+    assert cfg.ptt.enabled is False
+    reset_config()
 
 
 def test_get_status_recovers_generated_at_from_existing_digest(tmp_path):
@@ -261,3 +335,20 @@ async def test_maybe_generate_digest_clears_orphan_lock_from_previous_process(tm
 
     assert digest_path.exists()
     assert not lock_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_maybe_generate_digest_skips_when_disabled():
+    import lumina.digest.core as core
+    from lumina.digest.config import configure
+
+    class FakeLLM:
+        generate = AsyncMock(return_value="digest body")
+
+    configure({"digest": {"enabled": False}})
+    try:
+        with patch.object(core, "generate_digest", AsyncMock()) as mocked_generate:
+            await core.maybe_generate_digest(FakeLLM(), force_full=True)
+        mocked_generate.assert_not_called()
+    finally:
+        configure({"digest": {"enabled": True}})

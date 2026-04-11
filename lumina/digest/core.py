@@ -351,6 +351,9 @@ def load_digest() -> Optional[str]:
 
 async def maybe_generate_digest(llm, force_full: bool = False) -> None:
     """启动时调用：全量摘要（若需要）。用 lock 文件防并发。"""
+    if not get_cfg().enabled:
+        logger.info("Digest disabled, skipping full generation")
+        return
     _sync_status_from_digest_file()
     _clear_orphan_lock_if_needed()
     if _LOCK_PATH.exists():
@@ -372,6 +375,9 @@ async def maybe_generate_digest(llm, force_full: bool = False) -> None:
 
 async def maybe_generate_changelog(llm) -> None:
     """每小时定时调用：增量 Change Log。"""
+    if not get_cfg().enabled:
+        logger.info("Digest disabled, skipping changelog generation")
+        return
     if _LOCK_PATH.exists():
         return
     try:
@@ -386,6 +392,7 @@ async def maybe_generate_changelog(llm) -> None:
 def get_status() -> dict:
     _sync_status_from_digest_file()
     return {
+        "enabled": get_cfg().enabled,
         "generating": _generating,
         "generated_at": _generated_at,
     }

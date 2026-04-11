@@ -50,6 +50,38 @@ def _resolve_config_path() -> str | None:
     return None
 
 
+def _is_digest_enabled() -> bool:
+    from lumina.digest.config import get_cfg
+
+    return bool(get_cfg().enabled)
+
+
+def _persist_digest_enabled(enabled: bool, config_path: str | None = None) -> None:
+    """
+    将 digest.enabled 持久化到用户配置（~/.lumina/config.json）。
+    若用户配置不存在，则以当前生效配置（或包内默认配置）为模板创建。
+    """
+    target = _USER_CONFIG_PATH
+    source = Path(config_path) if config_path else (Path(__file__).parent / "config.json")
+    data = {}
+    if target.exists():
+        with open(target, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    elif source.exists():
+        with open(source, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+    digest_cfg = data.get("digest")
+    if not isinstance(digest_cfg, dict):
+        digest_cfg = {}
+    digest_cfg["enabled"] = bool(enabled)
+    data["digest"] = digest_cfg
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(target, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
 def _lite_setup_wizard():
     """
     Lite 版首次启动向导：引导用户填写外部服务地址，写入 ~/.lumina/config.json。
@@ -296,7 +328,10 @@ def cmd_server(args):
         import asyncio
         _uvicorn_loop.append(asyncio.get_running_loop())
 
-    threading.Thread(target=_startup_digest, daemon=True).start()
+    if _is_digest_enabled():
+        threading.Thread(target=_startup_digest, daemon=True).start()
+    else:
+        logger.info("Digest is disabled: skip startup generation")
 
     # 优先级：CLI --digest-interval > LUMINA_DIGEST_INTERVAL 环境变量 > config.json refresh_hours
     _env_interval = int(os.environ.get("LUMINA_DIGEST_INTERVAL", 0))
@@ -306,7 +341,7 @@ def cmd_server(args):
     _start_daily_notify_timer(llm, uvicorn_loop=_uvicorn_loop)
 
     if sys.platform == "darwin" and (_EDITION in ("full", "lite") or getattr(args, "menubar", False)):
-        _run_with_menubar(fastapi_app, cfg, llm)
+        _run_with_menubar(fastapi_app, cfg, llm, config_path=config_path)
     else:
         if sys.platform == "darwin":
             _start_ptt(cfg, menubar_app=None)
@@ -318,6 +353,9 @@ def cmd_server(args):
 
 def _run_digest_task(llm, changelog: bool = False, uvicorn_loop: list = None):
     """digest 任务投递到 uvicorn event loop 执行，避免 asyncio.run() 创建新 loop 破坏 LocalProvider 状态。"""
+    if not _is_digest_enabled():
+        logger.debug("Digest disabled, skip scheduled task")
+        return
     import asyncio
     from lumina.digest import maybe_generate_digest, maybe_generate_changelog
     coro = maybe_generate_changelog(llm) if changelog else maybe_generate_digest(llm)
@@ -379,6 +417,12 @@ def _start_daily_notify_timer(llm, uvicorn_loop: list = None):
         return target_ts - now
 
     def _fire():
+        if not _is_digest_enabled():
+            # 保持每日重试节奏，避免需要重启才能恢复定时任务
+            t = threading.Timer(86400, _fire)
+            t.daemon = True
+            t.start()
+            return
         from lumina.digest import maybe_generate_digest
         from lumina.digest.core import load_digest
         # 强制全量重新生成今日日报，投递到 uvicorn loop 避免与正在进行的请求竞争
@@ -403,6 +447,8 @@ def _start_daily_notify_timer(llm, uvicorn_loop: list = None):
     notify_time = get_cfg().notify_time
     if not notify_time:
         return  # 空字符串表示禁用
+    if not _is_digest_enabled():
+        logger.info("Digest is disabled: daily notify timer stays idle")
     delay = _seconds_to_next_notify(notify_time)
     if delay < 0:
         logger.warning("Daily notify: invalid notify_time %r, skipping", notify_time)
@@ -424,6 +470,10 @@ def _start_ptt(cfg, menubar_app=None):
     - 读取失败（JSON 损坏等）→ 打印警告，保留当前热键不变
     - 读取成功且热键/语言有变化 → 停旧 PTTDaemon，启新的
     """
+    if not getattr(cfg.ptt, "enabled", True):
+        logger.info("PTT is disabled by config (ptt.enabled=false), skipping")
+        return
+
     import threading
     import json
     from pathlib import Path
@@ -499,7 +549,7 @@ def _start_ptt(cfg, menubar_app=None):
     return _current_ptt   # 供调用方拿到当前 daemon 引用
 
 
-def _run_with_menubar(fastapi_app, cfg, llm):
+def _run_with_menubar(fastapi_app, cfg, llm, config_path: str | None = None):
     """启动 rumps 菜单栏 App，uvicorn 在后台线程运行。"""
     import threading
     import uvicorn
@@ -537,14 +587,34 @@ def _run_with_menubar(fastapi_app, cfg, llm):
         def __init__(self):
             super().__init__(title, icon=_icon_path, quit_button=None, template=False)
             self._ptt_ref: list = []   # _start_ptt 启动后写入
+            self._digest_toggle_item = rumps.MenuItem("", callback=self._toggle_digest)
+            self._refresh_digest_menu_label()
             self.menu = [
                 rumps.MenuItem("打开界面", callback=self._open_ui),
+                self._digest_toggle_item,
                 None,  # 分隔线
                 rumps.MenuItem(_PAUSE_LABEL, callback=self._toggle_ptt),
                 None,
                 rumps.MenuItem("重启服务", callback=self._restart),
                 rumps.MenuItem("退出 Lumina", callback=self._quit),
             ]
+
+        def _refresh_digest_menu_label(self):
+            self._digest_toggle_item.title = (
+                "停止 Digest 定时采集" if _is_digest_enabled() else "开启 Digest 定时采集"
+            )
+
+        def _toggle_digest(self, _):
+            from lumina.digest.config import set_enabled
+
+            enabled = not _is_digest_enabled()
+            set_enabled(enabled)
+            try:
+                _persist_digest_enabled(enabled, config_path=config_path)
+            except Exception as e:
+                logger.error("Failed to persist digest toggle: %s", e)
+            self._refresh_digest_menu_label()
+            logger.info("Digest toggled via menubar: enabled=%s", enabled)
 
         def _open_ui(self, _):
             import subprocess

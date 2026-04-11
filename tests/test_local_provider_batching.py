@@ -12,6 +12,7 @@ prefill / decode 成本。这样可以稳定验证两件事：
 from __future__ import annotations
 
 import asyncio
+import os
 import statistics
 import time
 from contextlib import suppress
@@ -368,6 +369,66 @@ def test_load_keeps_provider_ready_when_warmup_fails(monkeypatch):
     assert provider.is_ready
 
 
+def test_load_falls_back_to_default_repo_when_default_local_dir_missing(monkeypatch, tmp_path):
+    missing_default_dir = tmp_path / "models" / "qwen3.5-0.8b-4bit"
+    provider = LocalProvider(model_path=str(missing_default_dir))
+    load_calls = []
+
+    monkeypatch.setattr(provider, "_find_cached_repo_snapshot", lambda repo_id: None)
+    monkeypatch.setattr(local_mod, "load", lambda model_path: (load_calls.append(model_path) or (FakeLoadedModel(), FakeLoadedTokenizer())))
+    monkeypatch.setattr(provider, "_init_batch_engine", lambda: None)
+    monkeypatch.setattr(provider, "_run_warmup", lambda: None)
+
+    provider.load()
+
+    assert load_calls == [local_mod._DEFAULT_MODEL_REPO_ID]
+
+
+def test_load_uses_existing_local_model_dir(monkeypatch, tmp_path):
+    local_model_dir = tmp_path / "models" / "qwen3.5-0.8b-4bit"
+    local_model_dir.mkdir(parents=True)
+    provider = LocalProvider(model_path=str(local_model_dir))
+    load_calls = []
+
+    monkeypatch.setattr(local_mod, "load", lambda model_path: (load_calls.append(model_path) or (FakeLoadedModel(), FakeLoadedTokenizer())))
+    monkeypatch.setattr(provider, "_init_batch_engine", lambda: None)
+    monkeypatch.setattr(provider, "_run_warmup", lambda: None)
+
+    provider.load()
+
+    assert load_calls == [str(local_model_dir)]
+
+
+def test_resolve_load_target_uses_cached_snapshot_when_default_dir_missing(monkeypatch, tmp_path):
+    missing_default_dir = tmp_path / "models" / "qwen3.5-0.8b-4bit"
+    provider = LocalProvider(model_path=str(missing_default_dir))
+    cached_snapshot = str(tmp_path / "cache" / "snapshots" / "abc")
+
+    monkeypatch.setattr(provider, "_find_cached_repo_snapshot", lambda repo_id: cached_snapshot)
+
+    assert provider._resolve_load_target() == cached_snapshot
+
+
+def test_find_cached_repo_snapshot_prefers_latest(monkeypatch, tmp_path):
+    provider = LocalProvider(model_path="synthetic")
+    hub_dir = tmp_path / "hub"
+    snapshots = hub_dir / "models--mlx-community--Qwen3.5-0.8B-4bit" / "snapshots"
+    old_snapshot = snapshots / "old"
+    new_snapshot = snapshots / "new"
+    old_snapshot.mkdir(parents=True)
+    new_snapshot.mkdir(parents=True)
+    (old_snapshot / "model.safetensors").write_text("x")
+    (new_snapshot / "model.safetensors").write_text("x")
+
+    old_ts = 100
+    new_ts = 200
+    os.utime(old_snapshot, (old_ts, old_ts))
+    os.utime(new_snapshot, (new_ts, new_ts))
+    monkeypatch.setenv("HUGGINGFACE_HUB_CACHE", str(hub_dir))
+
+    assert provider._find_cached_repo_snapshot(local_mod._DEFAULT_MODEL_REPO_ID) == str(new_snapshot)
+
+
 def test_system_prompt_cache_reuses_prefix_cache(monkeypatch):
     class FakeCacheLayer:
         def __init__(self, state):
@@ -484,3 +545,112 @@ def test_prepare_batch_generator_prompt_reconstructs_full_prompt_when_cache_hits
 
     assert prompt_cache is not None
     assert provider._system_prompt_cache["sys"].prefix_tokens + suffix_tokens == [1, 2, 3, 4, 5]
+
+
+def test_iter_batch_responses_flattens_nested_containers():
+    provider = LocalProvider(model_path="synthetic")
+    r1 = {"uid": 1, "token": 10, "finish_reason": None}
+    r2 = {"uid": 2, "token": 11, "finish_reason": None}
+    r3 = {"uid": 3, "token": 12, "finish_reason": "stop"}
+    nested = [[r1, [r2]], (r3,)]
+
+    flattened = list(provider._iter_batch_responses(nested))
+
+    assert flattened == [r1, r2, r3]
+
+
+def test_response_field_helpers_support_dict_payloads():
+    provider = LocalProvider(model_path="synthetic")
+    resp = {"uid": 7, "token": "42", "finish_reason": "stop"}
+
+    assert provider._response_uid(resp) == 7
+    assert provider._response_token(resp) == 42
+    assert provider._response_finish_reason(resp) == "stop"
+
+
+def test_batch_generator_pending_probe_is_compatible_with_missing_field():
+    provider = LocalProvider(model_path="synthetic")
+
+    class FakeBatchGenerator:
+        pass
+
+    provider._batch_generator = FakeBatchGenerator()
+
+    assert provider._batch_generator_has_unprocessed_prompts() is False
+
+
+def test_batch_generator_pending_probe_reads_unprocessed_prompts_field():
+    provider = LocalProvider(model_path="synthetic")
+
+    class FakeBatchGenerator:
+        def __init__(self):
+            self.unprocessed_prompts = [1]
+
+    provider._batch_generator = FakeBatchGenerator()
+
+    assert provider._batch_generator_has_unprocessed_prompts() is True
+
+
+def test_extract_generation_responses_prefers_generation_part_for_tuple():
+    provider = LocalProvider(model_path="synthetic")
+    prompt_responses = [{"uid": 1, "token": None, "finish_reason": None}]
+    generation_responses = [{"uid": 2, "token": 7, "finish_reason": None}]
+
+    extracted = provider._extract_generation_responses((prompt_responses, generation_responses))
+
+    assert extracted == generation_responses
+
+
+def test_extract_generation_responses_keeps_non_tuple_payload():
+    provider = LocalProvider(model_path="synthetic")
+    payload = [{"uid": 2, "token": 7, "finish_reason": None}]
+
+    extracted = provider._extract_generation_responses(payload)
+
+    assert extracted == payload
+
+
+def test_render_prompt_disables_thinking_when_tokenizer_supports_flag():
+    provider = LocalProvider(model_path="synthetic")
+
+    class FakeTokenizer:
+        def apply_chat_template(
+            self,
+            messages,
+            *,
+            tokenize=False,
+            add_generation_prompt=False,
+            enable_thinking=True,
+        ):
+            assert tokenize is False
+            assert add_generation_prompt is True
+            assert enable_thinking is False
+            return "prompt"
+
+    provider._tokenizer = FakeTokenizer()
+
+    prompt = provider._render_prompt_text("sys", "user")
+
+    assert prompt == "prompt"
+
+
+def test_render_prompt_falls_back_when_tokenizer_has_no_thinking_flag():
+    provider = LocalProvider(model_path="synthetic")
+
+    class FakeTokenizer:
+        def apply_chat_template(
+            self,
+            messages,
+            *,
+            tokenize=False,
+            add_generation_prompt=False,
+        ):
+            assert tokenize is False
+            assert add_generation_prompt is True
+            return "prompt"
+
+    provider._tokenizer = FakeTokenizer()
+
+    prompt = provider._render_prompt_text("sys", "user")
+
+    assert prompt == "prompt"

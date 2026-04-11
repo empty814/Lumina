@@ -37,6 +37,7 @@ class DigestConfig:
     refresh_hours: float = 1.0    # 每隔多久检查一次增量
     notify_time: str = "20:00"    # 每日通知时间，格式 "HH:MM"，空字符串表示禁用
     enabled_collectors: Optional[List[str]] = None  # None = 全部启用
+    enabled: bool = True  # False = 完全关闭 digest（不自动也不手动生成）
 
 
 _cfg: DigestConfig = DigestConfig()
@@ -68,4 +69,9 @@ def configure(data: dict) -> None:
         refresh_hours=float(d.get("refresh_hours", 1.0)),
         notify_time=str(d.get("notify_time", "20:00")),
         enabled_collectors=d.get("enabled_collectors", None),
+        enabled=bool(d.get("enabled", True)),
     )
+
+
+def set_enabled(enabled: bool) -> None:
+    _cfg.enabled = bool(enabled)
