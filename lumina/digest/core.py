@@ -1,45 +1,23 @@
 """
-lumina/digest/core.py — 摘要生成、增量检测、状态管理
+lumina/digest/core.py — 摘要生成、状态管理
 
 ──────────────────────────────────────────────────────────────────────────────
-Digest 机制说明（状态机）
+Digest 机制说明
 ──────────────────────────────────────────────────────────────────────────────
 
-Lumina 维护三套触发路径，写同一个文件（~/.lumina/digest.md），但用途不同：
+Lumina 每小时运行一次摘要生成，每次都取过去 history_hours（默认 24h）内各来源
+最新的 top N 条记录。没有增量/全量之分，每次都是当前时刻回头看的完整快照。
 
-1. 全量日报（generate_digest）
-   ─ 触发：进程启动时 maybe_generate_digest()，或用户手动点"刷新"
-   ─ 采集：since_ts=None → 使用 config.history_hours（默认 24h）全量采集
-   ─ Prompt：DIGEST_SYSTEM_PROMPT（工作上下文助手，220-350 字）
-   ─ 写入：prepend 到 digest.md 头部，旧条目永久保留
-   ─ 副作用：更新 _last_generated_ts，供后续 changelog 用作增量起点
+生成结果写入 ~/.lumina/digest.md（新条目 prepend 到头部，历史永久保留）。
 
-2. 增量 Changelog（generate_changelog）
-   ─ 触发：定时器每隔 refresh_hours（默认 1h）调用 maybe_generate_changelog()
-   ─ 采集：since_ts=_last_generated_ts → 只采集上次生成后的新数据
-   ─ Prompt：CHANGELOG_SYSTEM_PROMPT（只写真正影响工作的变化，否则输出「无显著变化」）
-   ─ 写入：有实质变化才 prepend；LLM 判断无变化时直接 return None，不写文件
-   ─ 副作用：有写入时更新 _last_generated_ts
-
-3. 每日通知（daily notify，在 main.py 中触发）
-   ─ 触发：每天到 config.notify_time（默认 20:00）的那次定时器
-   ─ 行为：强制全量 generate_digest（force_full=True），忽略 history_hours 限制
-   ─ 额外：通过系统通知推送给用户
+每日通知（daily notify，在 main.py 中触发）：
+  ─ 触发：每天到 config.notify_time（默认 20:00）的那次定时器
+  ─ 行为：调用 generate_digest（与普通定时器相同）
+  ─ 额外：通过系统通知推送给用户
 
 关键状态变量：
-  _last_generated_ts  上次成功生成（全量或 changelog）的 Unix 时间戳
-                      ↳ collector cursor 的上界；进程重启后从 digest.md mtime 恢复
-  _generated_at       ISO 时间字符串，供 API /v1/digest 返回给前端展示
-  _generating         布尔，防止并发生成，前端可轮询此字段显示 loading 状态
-
-collector cursor 与 _last_generated_ts 的关系：
-  ┌──────────────┐  _collect_all(since_ts=_last_generated_ts)
-  │ _last_generated_ts ──────────────────────────────┐
-  │                                                   ↓
-  │  _CURSORS["_fallback"] = now - effective_hours    │ 各 collector 以此为下界
-  │  各 collector._CURSORS[name] = 上次该 collector 最新记录时间戳（更精细）
-  └──────────────────────────────────────────────────────────────────────────
-  collector cursor 比 _fallback 更精确，可独立滚动，互不影响。
+  _generated_at  ISO 时间字符串，供 API /v1/digest 返回给前端展示
+  _generating    布尔，防止并发生成，前端可轮询此字段显示 loading 状态
 ──────────────────────────────────────────────────────────────────────────────
 """
 import asyncio
@@ -52,9 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import lumina.digest.collectors as _collectors_mod
 from lumina.digest.config import get_cfg, override_history_hours
-from lumina.digest.cursor_store import load_cursors, save_cursors
 from lumina.digest.collectors import (
     collect_shell_history,
     collect_git_logs,
@@ -74,7 +50,7 @@ _CONTEXT_LOG_DIR = Path.home() / ".lumina" / "digest_context_log"
 # 模块级状态，供 API 查询；asyncio 协程与 threading.Timer 线程共享，需加锁保护
 _state_lock = threading.Lock()
 # asyncio.Lock：真正防止同一 event loop 内两个协程并发生成 digest
-# 注意：必须在 event loop 内使用（maybe_generate_* 均为 async），不跨进程
+# 注意：必须在 event loop 内使用（maybe_generate_digest 为 async），不跨进程
 _digest_lock: Optional[asyncio.Lock] = None
 _generating: bool = False
 _generated_at: Optional[str] = None
@@ -134,49 +110,14 @@ DIGEST_SYSTEM_PROMPT = """\
 
 整体简洁、具体、可继续，总长度控制在 220-350 字。"""
 
-CHANGELOG_SYSTEM_PROMPT = """\
-你是用户的本地工作上下文助手。下面是用户自上次记录以来新增的本地活动。
-
-你的任务不是写流水账，而是判断这些新增活动是否改变了用户当前的工作上下文，并记录真正值得记住的变化。
-
-请遵循以下原则：
-- 只写会影响后续工作的变化。
-- 优先提炼：新推进了什么、焦点转到了什么、出现了什么待办、阻塞或决策点。
-- 如果只是重复浏览、零散操作或低价值噪音，不要强行总结。
-- 不要写空话，不要泛泛概括，不要复述一堆细节。
-
-如果没有明显变化，输出：
-（无显著变化）
-
-如果有明显变化，输出 2-4 句话，像写给稍后回来的自己看的工作备注，要求简洁、具体、可继续。"""
-
-
-# ── 增量检测 ──────────────────────────────────────────────────────────────────
-
 
 # ── 采集 ──────────────────────────────────────────────────────────────────────
 
-async def _collect_all(since_ts: Optional[float] = None) -> str:
-    """采集所有数据源。
-
-    since_ts: 上次生成的时间戳（秒）。若提供，采集窗口 = min(距今时长, max_hours)；
-              否则使用 config.history_hours（全量，首次启动或强制刷新时）。
-    """
+async def _collect_all() -> str:
+    """采集所有数据源，始终使用 cfg.history_hours 窗口的完整快照。"""
     global _last_collector_results
     cfg = get_cfg()
-    if since_ts is not None:
-        elapsed_hours = (time.time() - since_ts) / 3600
-        effective_hours = min(elapsed_hours, cfg.history_hours)
-        # 至少 5 分钟，避免极短窗口导致采集为空
-        effective_hours = max(effective_hours, 5 / 60)
-    else:
-        effective_hours = cfg.history_hours
-
-    # ── 注入 per-collector cursor ─────────────────────────────────────────────
-    cursors = load_cursors()
-    fallback_ts = time.time() - effective_hours * 3600
-    cursors["_fallback"] = fallback_ts
-    _collectors_mod._CURSORS = cursors          # 线程启动前写入，collector 只读
+    effective_hours = cfg.history_hours
 
     active = _COLLECTORS
     if cfg.enabled_collectors is not None:
@@ -184,9 +125,8 @@ async def _collect_all(since_ts: Optional[float] = None) -> str:
         active = [fn for fn in _COLLECTORS if fn.__name__ in enabled_set]
 
     logger.info(
-        "Digest collect start: effective_hours=%.2f fallback_since=%s active_collectors=%s",
+        "Digest collect start: effective_hours=%.2f active_collectors=%s",
         effective_hours,
-        datetime.fromtimestamp(fallback_ts).strftime("%Y-%m-%d %H:%M:%S"),
         [fn.__name__ for fn in active],
     )
 
@@ -195,7 +135,6 @@ async def _collect_all(since_ts: Optional[float] = None) -> str:
 
     loop = asyncio.get_running_loop()
     # shutdown(wait=False)：超时取消等待后不阻塞等待慢线程，避免单个 collector 卡住整个采集。
-    # 超时线程仍在后台运行直到自然结束，但不影响本次 digest 生成。
     executor = ThreadPoolExecutor(max_workers=max(len(active), 1))
 
     async def _run_with_timeout(fn):
@@ -217,18 +156,11 @@ async def _collect_all(since_ts: Optional[float] = None) -> str:
     finally:
         executor.shutdown(wait=False)
 
-    # ── 保存 collector 写回的 cursor（去掉内部哨兵 key）─────────────────────
-    updated = {k: v for k, v in _collectors_mod._CURSORS.items()
-               if not k.startswith("_")}
-    save_cursors(updated)
-
     cache = {}
     sections = []
     for fn, r in zip(active, results):
         name = fn.__name__
         if isinstance(r, Exception):
-            # 直接用 str(r)；_run_with_timeout 返回的是普通 Exception 对象，
-            # 此处没有活跃异常上下文，traceback.format_exc() 只会得到空栈。
             cache[name] = {"chars": 0, "lines": 0, "preview": None,
                            "error": str(r)}
             logger.warning("Digest: collector %s error: %s", name, str(r))
@@ -314,10 +246,9 @@ async def generate_digest(llm) -> str:
     with _state_lock:
         _generating = True
     try:
-        # 全量生成不传 since_ts，使用 config.history_hours
-        context = await _collect_all(since_ts=None)
+        context = await _collect_all()
         _save_context_log(context, "full")
-        logger.info("Digest: generating full summary...")
+        logger.info("Digest: generating summary...")
         summary = await llm.generate(
             context, task="chat",
             system=DIGEST_SYSTEM_PROMPT,
@@ -332,43 +263,6 @@ async def generate_digest(llm) -> str:
             _generated_at = now.isoformat()
             _last_generated_ts = now.timestamp()
         logger.info("Digest: saved to %s", _DIGEST_PATH)
-        return entry
-    finally:
-        with _state_lock:
-            _generating = False
-
-
-async def generate_changelog(llm) -> Optional[str]:
-    """增量 Change Log：采集新活动并追加条目，collector 无新数据时 LLM 自行判断跳过。"""
-    global _generating, _generated_at, _last_generated_ts
-    with _state_lock:
-        _generating = True
-        since_ts = _last_generated_ts
-    try:
-        # 增量生成：只采集上次生成到现在的数据
-        context = await _collect_all(since_ts=since_ts)
-        _save_context_log(context, "changelog")
-        elapsed = (time.time() - since_ts) / 3600 if since_ts else None
-        logger.info("Digest: generating changelog (window=%.1fh)...",
-                    min(elapsed, get_cfg().history_hours) if elapsed else get_cfg().history_hours)
-        changelog = await llm.generate(
-            context, task="chat",
-            system=CHANGELOG_SYSTEM_PROMPT,
-            max_tokens=200, temperature=0.4,
-        )
-        if changelog.strip() == "（无显著变化）" or not changelog.strip():
-            logger.debug("Digest: changelog indicates no significant change")
-            return None
-
-        now = datetime.now()
-        entry = (f"<!-- generated: {now.isoformat()} -->\n"
-                 f"# {now.strftime('%Y-%m-%d %H:%M')} 更新\n\n"
-                 + changelog.strip() + "\n")
-        _prepend_entry(entry)
-        with _state_lock:
-            _generated_at = now.isoformat()
-            _last_generated_ts = now.timestamp()
-        logger.info("Digest: changelog appended")
         return entry
     finally:
         with _state_lock:
@@ -394,15 +288,6 @@ def _sync_status_from_digest_file() -> None:
         _last_generated_ts = mtime
 
 
-
-def should_regenerate_full(max_age_hours: Optional[float] = None) -> bool:
-    cfg = get_cfg()
-    age_limit = max_age_hours if max_age_hours is not None else cfg.history_hours
-    if not _DIGEST_PATH.exists():
-        return True
-    return time.time() - _DIGEST_PATH.stat().st_mtime > age_limit * 3600
-
-
 def load_digest() -> Optional[str]:
     if not _DIGEST_PATH.exists():
         return None
@@ -410,9 +295,9 @@ def load_digest() -> Optional[str]:
 
 
 async def maybe_generate_digest(llm, force_full: bool = False) -> None:
-    """启动时调用：全量摘要（若需要）。用 asyncio.Lock 防并发。"""
+    """定时/启动时调用。用 asyncio.Lock 防并发。force_full 忽略不用。"""
     if not get_cfg().enabled:
-        logger.info("Digest disabled, skipping full generation")
+        logger.info("Digest disabled, skipping generation")
         return
     _sync_status_from_digest_file()
 
@@ -421,33 +306,11 @@ async def maybe_generate_digest(llm, force_full: bool = False) -> None:
         logger.debug("Digest: locked, skipping")
         return
 
-    if not force_full and not should_regenerate_full():
-        logger.debug("Digest: still fresh, skipping full generation")
-        return
-
     async with lock:
         try:
             await generate_digest(llm)
         except Exception as e:
-            logger.error("Digest full generation failed: %s", e)
-
-
-async def maybe_generate_changelog(llm) -> None:
-    """每小时定时调用：增量 Change Log。"""
-    if not get_cfg().enabled:
-        logger.info("Digest disabled, skipping changelog generation")
-        return
-
-    lock = _get_digest_lock()
-    if lock.locked():
-        logger.debug("Digest: locked, skipping changelog")
-        return
-
-    async with lock:
-        try:
-            await generate_changelog(llm)
-        except Exception as e:
-            logger.error("Digest changelog failed: %s", e)
+            logger.error("Digest generation failed: %s", e)
 
 
 def get_status() -> dict:
@@ -476,6 +339,5 @@ def get_debug_info() -> dict:
         },
         "last_generated_ts": last_ts,
         "collectors": collectors_snapshot,
-        "cursors": load_cursors(),
         "md_files": _col._last_md_files,
     }

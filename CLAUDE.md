@@ -23,12 +23,19 @@
 
 ```
 lumina/
-  main.py              # CLI 入口，所有子命令在此注册
+  main.py              # CLI 入口：argparse 骨架 + main()，不含业务逻辑
   config.py / config.json  # 配置加载，端口默认 31821
+  cli/                 # 子命令实现（v0.6 从 main.py 拆出）
+    server.py          # cmd_server / cmd_stop / cmd_restart，含菜单栏 App
+    pdf.py             # cmd_pdf / cmd_summarize / cmd_watch
+    text.py            # cmd_polish / cmd_popup
+    setup.py           # ensure_model / lite_setup_wizard
+    utils.py           # 公共工具：日志、config 路径、PID、Banner 等
   api/
     server.py          # FastAPI 路由
     static/index.html  # 单页 Web UI（无构建步骤，直接编辑）
   providers/
+    __init__.py        # 懒加载：LocalProvider / OpenAIProvider 按需 import（见下节）
     local.py           # mlx-lm 本地推理，含 Continuous Batching
     openai.py          # OpenAI 兼容远程接口
   engine/llm.py        # 上层封装，提供 stream / chat 接口
@@ -59,41 +66,51 @@ bash scripts/build_full.sh    # 打包为 Lumina.app
 
 ## 关键设计决策
 
+### Providers 懒加载（`providers/__init__.py`）
+
+`LocalProvider`（依赖 `mlx`）和 `OpenAIProvider` 通过模块级 `__getattr__` 懒加载，不在顶层 import：
+
+```python
+def __getattr__(name: str):
+    if name == "LocalProvider":
+        from .local import LocalProvider
+        return LocalProvider
+    ...
+```
+
+**原因**：`mlx` 在非 macOS 平台（如 Linux CI）import 时直接报错。懒加载后 `from lumina.providers import BaseProvider` 在任何平台均安全，`LocalProvider` 只在实际使用时才被加载。**不要改回顶层 import。**
+
 ### Continuous Batching（`providers/local.py`）
 - `_RequestSlot`：每个请求独立的 `asyncio.Queue` 传 token，无共享状态
 - 调度器：Phase 1 prefill 新请求，Phase 2 只推进 **prefill 前已存在** 的 slot（快照 `existing_decode`），防止首 token 被覆盖
 - EOS 检测：mlx-lm `generate_step` 不自动停，手动检测 token id 248046（`<|im_end|>`）
 
-### Per-Collector Cursors（采集器游标）
+### Digest 采集模式（纯全量快照）
 
-每个 collector 独立记录「上次采集到的最新记录时间戳」，下次只读新数据，各来源互不影响。
+每个 collector 每次都取 `time.time() - cfg.history_hours * 3600` 作为截止时间，没有增量/全量之分。**没有 cursor 机制。**
 
-**存储：** `~/.lumina/collector_cursors.json`，格式 `{"collect_xxx": unix_timestamp_float}`，由 `cursor_store.py` 原子读写。
+每次运行都是"现在回头看过去 N 小时"的完整快照，各来源最多返回 top N 条按时间倒序的记录。
 
-**流程：**
-1. `_collect_all()` 开始时调用 `load_cursors()` 读取 cursor 文件
-2. 注入 `_collectors_mod._CURSORS`（含各 collector cursor + `"_fallback"` 哨兵 = `now - effective_hours`）
-3. `ThreadPoolExecutor` 启动，各 collector 调用 `_get_cursor(name)` 读自己的 cursor，采集完后调用 `_set_cursor(name, newest_ts)` 写回
-4. executor 结束后，`core.py` 调用 `save_cursors()` 持久化
+**各来源截止时间计算：**
 
-**各来源 cursor 语义：**
+| Collector | cutoff 用法 | 数据源字段 |
+|---|---|---|
+| collect_shell_history | `cutoff = time.time() - history_hours * 3600` | zsh `: ts:0;cmd` 前缀 |
+| collect_git_logs | `--since=datetime.fromtimestamp(cutoff)` | `git log --format=%ct` |
+| collect_clipboard | 无状态 | — |
+| collect_browser_history | 各浏览器 epoch 转换 | Chrome µs；Firefox µs；Safari CoreData epoch |
+| collect_notes_app | `cutoff_core = cutoff - 978307200` | `ZMODIFICATIONDATE1` |
+| collect_markdown_notes | `mtime > cutoff` + md5 内容去重 | `st_mtime` |
+| collect_ai_queries | `ts <= cutoff` 跳过 | 各子来源 Unix 秒 |
 
-| Collector | cursor 单位 | 数据源字段 | 兜底 |
-|---|---|---|---|
-| collect_shell_history | Unix 秒 | zsh `: ts:0;cmd` 前缀 | 文件无时间戳 → 取最近 100 条，不更新 cursor |
-| collect_git_logs | Unix 秒 → `--since=` | `git log --format=%ct` | cursor=fallback |
-| collect_clipboard | 无 cursor（无状态） | — | — |
-| collect_browser_history | Unix 秒（查询时转换）| Chrome: `last_visit_time`（Chrome epoch µs）；Firefox: `last_visit_date`（Unix µs） | cursor=fallback |
-| collect_notes_app | Unix 秒（查询时 `-978307200` 转 CoreData epoch） | `ZMODIFICATIONDATE1` | cursor=fallback |
-| collect_markdown_notes | Unix 秒 | `st_mtime` | cursor=fallback |
-| collect_ai_queries | Unix 秒（各子来源统一转换）| Cursor IDE 无时间戳，用 db mtime | cursor=fallback |
+**Markdown 去重：** `cursor_store.py` 仅保留 `md5_of_file` + `load_md_hashes`/`save_md_hashes`，用于过滤 mtime 改变但内容未变的文件（iCloud 同步、编辑器扫描等）。
 
-**兜底机制：**
-- cursor 文件缺失/损坏 → `load_cursors()` 返回 `{}`，所有 collector 使用 `_fallback`（= `now - effective_hours`）
-- 单个 collector 无 cursor → 使用 `_fallback`
-- `effective_hours = min(距上次生成时长, cfg.history_hours)`，见下节「日报定时生成」
+### Digest 并发安全（`digest/core.py`）
 
-**重置方法：** 删除 `~/.lumina/collector_cursors.json`（全部重置）或删除其中某个 key（单个来源重置），下次采集自动用 `history_hours` 作为初始窗口。
+- **锁机制**：`asyncio.Lock`（`_digest_lock`），懒初始化（`_get_digest_lock()`）。`maybe_generate_digest` / `maybe_generate_changelog` 在 acquire 前先检查 `lock.locked()`，已锁则直接跳过（非阻塞等待）。
+- **不要用文件锁**：之前用过 `.lock` 文件 + `exists()`/`touch()`，但文件锁在单进程 asyncio 中无法防止并发重入（两个协程可能在 `exists()` 返回 False 后、`touch()` 执行前同时通过检查）。asyncio.Lock 是真正原子的。
+- **executor 超时后不阻塞**：`_collect_all()` 里 `ThreadPoolExecutor` 在 `finally` 中调用 `shutdown(wait=False)`，允许主协程在 30s 超时后立即返回，慢 collector 线程在后台继续完成后自然退出。**不要改成 `wait=True`**，否则整个 digest 生成会被单个慢 collector 卡住。
+- **`digest.enabled` 默认值**：`DigestConfig.enabled = False`（dataclass），`configure()` 中 key 缺失时也默认 `False`。**不要把 `configure()` 里的默认值改成 `True`**，否则与 dataclass 语义不一致，导致「配置文件没有 digest 段时误启用日报」。
 
 ### 日报定时生成
 - `.app` 模式：`rumps.timer(3600)` 在 `_run_with_menubar()` 中触发

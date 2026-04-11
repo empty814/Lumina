@@ -16,11 +16,25 @@
   "port": 31821,
   "log_level": "INFO",
   "digest": {
-    "_readme": "enabled=false 可完全关闭 digest（不再定时采集/生成）；scan_dirs 为空时使用默认目录（~/Documents, ~/Desktop 等）；enabled_collectors 为 null 时全部启用，填列表可按需禁用某个来源，可选值：collect_shell_history / collect_git_logs / collect_clipboard / collect_browser_history / collect_calendar / collect_notes_app / collect_markdown_notes / collect_ai_queries",
+    "_readme": "日报功能配置。enabled=true 开启定时采集与生成；scan_dirs 填 [] 表示不扫描任何目录，缺省时使用内置默认列表；enabled_collectors 为 null 时全部启用，填列表可按需只启用部分来源；notify_time 为每日推送时间（HH:MM），留空禁用",
     "enabled": false,
-    "scan_dirs": [],
+    "scan_dirs": [
+      "~/Documents",
+      "~/Desktop",
+      "~/Projects",
+      "~/code",
+      "~/dev",
+      "~/workspace",
+      "~/repos",
+      "~/Library/Mobile Documents/com~apple~CloudDocs",
+      "~/Library/Mobile Documents/iCloud~md~obsidian/Documents",
+      "~/Obsidian",
+      "~/Logseq",
+      "~/Notes"
+    ],
     "history_hours": 24,
     "refresh_hours": 1,
+    "notify_time": "20:00",
     "enabled_collectors": null
   },
   "ptt": {

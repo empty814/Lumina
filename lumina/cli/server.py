@@ -8,7 +8,7 @@ lumina/cli/server.py — server / stop / restart 子命令
   build_provider      — 根据 config 构造 Provider 实例
   _run_with_menubar   — rumps 菜单栏 App（含 LuminaApp 类）
   _start_ptt          — PTT 热键守护（含 hot reload）
-  _start_digest_timer — 整点 changelog 定时器
+  _start_digest_timer — 整点摘要定时器
   _start_daily_notify_timer — 每日定时全量日报 + 通知
   _run_digest_task    — 将 digest 协程投递到 uvicorn loop
   _ensure_quick_action_installed — 后台静默安装 Quick Action
@@ -59,15 +59,15 @@ def build_provider(cfg):
 
 # ── Digest 定时器 ─────────────────────────────────────────────────────────────
 
-def _run_digest_task(llm, changelog: bool = False, uvicorn_loop: list = None):
+def _run_digest_task(llm, uvicorn_loop: list = None):
     """将 digest 协程投递到 uvicorn event loop，避免 asyncio.run() 创建新 loop。"""
     from lumina.cli.utils import is_digest_enabled
     if not is_digest_enabled():
         logger.debug("Digest disabled, skip scheduled task")
         return
     import asyncio
-    from lumina.digest import maybe_generate_digest, maybe_generate_changelog
-    coro = maybe_generate_changelog(llm) if changelog else maybe_generate_digest(llm)
+    from lumina.digest import maybe_generate_digest
+    coro = maybe_generate_digest(llm)
     loop = uvicorn_loop[0] if uvicorn_loop else None
     if loop and loop.is_running():
         future = asyncio.run_coroutine_threadsafe(coro, loop)
@@ -80,7 +80,7 @@ def _run_digest_task(llm, changelog: bool = False, uvicorn_loop: list = None):
 
 
 def _start_digest_timer(llm, interval: int = 3600, uvicorn_loop: list = None):
-    """整点（或按 interval 覆盖）在后台线程生成 changelog。"""
+    """整点（或按 interval 覆盖）在后台线程生成摘要。"""
     import threading
     import time
 
@@ -89,7 +89,7 @@ def _start_digest_timer(llm, interval: int = 3600, uvicorn_loop: list = None):
         return 3600 - (now % 3600)
 
     def _loop():
-        _run_digest_task(llm, changelog=True, uvicorn_loop=uvicorn_loop)
+        _run_digest_task(llm, uvicorn_loop=uvicorn_loop)
         delay = _seconds_to_next_hour() if interval == 3600 else interval
         t = threading.Timer(delay, _loop)
         t.daemon = True
@@ -518,9 +518,8 @@ def cmd_server(args):
     _uvicorn_loop: list = []
 
     async def _startup_digest_coro():
-        from lumina.digest import maybe_generate_digest, maybe_generate_changelog
+        from lumina.digest import maybe_generate_digest
         await maybe_generate_digest(llm)
-        await maybe_generate_changelog(llm)
 
     def _startup_digest():
         import asyncio

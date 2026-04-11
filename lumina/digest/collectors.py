@@ -5,54 +5,36 @@ lumina/digest/collectors.py — 各数据源采集函数
 新增数据源：在此文件追加函数，并在 core.py 的 _COLLECTORS 列表中注册。
 
 ──────────────────────────────────────────────────────────────────
-Per-Collector Cursor 机制
-──────────────────────────────────────────────────────────────────
-每个 collector 自己记住「上次采集到的最新记录时间戳」（Unix 秒），
-下次只读新数据，各来源完全独立。
-
-_CURSORS 由 core.py 在 ThreadPoolExecutor 启动前注入：
-  _CURSORS["collect_xxx"] = 上次该 collector 最新记录的 Unix 时间戳
-  _CURSORS["_fallback"]   = now - effective_hours（全局兜底时间戳）
-
-每个 collector：
-  1. _get_cursor(name)   读自己的 cursor（无则用 _fallback）
-  2. 执行增量查询
-  3. _set_cursor(name, newest_ts)  写回本次最新时间戳
-
-cursor 存储在 ~/.lumina/collector_cursors.json，由 cursor_store.py 管理。
-
-──────────────────────────────────────────────────────────────────
 当前已支持的数据来源
 ──────────────────────────────────────────────────────────────────
 【终端历史】collect_shell_history
   └─ ~/.zsh_history 或 ~/.bash_history
-     解析 zsh 扩展格式（`: ts:0;cmd`），cursor 过滤，自动去重
+     解析 zsh 扩展格式（`: ts:0;cmd`），按 cutoff 过滤，自动去重
      兜底：文件无时间戳（bash history）→ 取最近 n=100 条
 
 【Git 提交】collect_git_logs
   └─ 扫描 scan_dirs 下深度 ≤3 的所有 .git 目录
-     cursor 对应 `git log --since=` 时间戳
+     --since= 使用 cutoff 时间戳
 
 【剪贴板】collect_clipboard
-  └─ macOS pbpaste，截断至 500 字符，无 cursor（无状态）
+  └─ macOS pbpaste，截断至 500 字符，无状态
 
 【浏览器历史】collect_browser_history
   ├─ Google Chrome  ~/Library/Application Support/Google/Chrome/Default/History
-  └─ Firefox        ~/Library/Application Support/Firefox/Profiles/*/places.sqlite
-     cursor 存 Unix 秒，查询时转换为各浏览器原生 epoch
+  ├─ Firefox        ~/Library/Application Support/Firefox/Profiles/*/places.sqlite
+  └─ Safari         ~/Library/Safari/History.db
 
 【备忘录（Notes.app）】collect_notes_app
   └─ 直接读取 NoteStore.sqlite
-     cursor 存 Unix 秒，查询时转换为 CoreData epoch（cursor - 978307200）
+     cutoff 转换为 CoreData epoch（cutoff - 978307200）
 
 【日历事项】collect_calendar
   └─ ~/Library/Group Containers/group.com.apple.calendar/Calendar.sqlitedb
      读取 OccurrenceCache + CalendarItem，采集今天及未来 cfg.history_hours 内的事件
-     无 cursor（日历事件按时间窗口查询，每次全量读取当前窗口）
 
 【本地 Markdown 笔记】collect_markdown_notes
-  └─ 扫描 scan_dirs 前两个目录（默认 ~/Documents, ~/Desktop）
-     cursor 直接与 st_mtime 比较（均为 Unix 秒）
+  └─ 扫描 scan_dirs 目录
+     mtime > cutoff + md5 去重（过滤 Cursor/iCloud 等 mtime-only 误触发）
 
 【AI 对话提问】collect_ai_queries
   ├─ Claude Code  ~/.claude/history.jsonl + projects/**/*.jsonl
@@ -77,36 +59,15 @@ from lumina.digest.cursor_store import load_md_hashes, md5_of_file, save_md_hash
 
 logger = logging.getLogger("lumina.digest")
 
-# ── Per-Collector Cursor ──────────────────────────────────────────────────────
-# 由 core.py 在 ThreadPoolExecutor 启动前注入，各 collector 只读自己的 key。
-# "_fallback" key = now - effective_hours（全局兜底时间戳）。
-_CURSORS: dict = {}
-
 # 上次 collect_markdown_notes 扫到的文件列表，供 debug 面板展示
 _last_md_files: list[dict] = []
-
-
-def _get_cursor(name: str) -> float:
-    """返回该 collector 的 since 时间戳（Unix 秒）。
-    无 cursor 或 cursor <= 0 时使用 _fallback，再无则用 24h 前。
-    """
-    ts = _CURSORS.get(name)
-    if not ts or ts <= 0:
-        ts = _CURSORS.get("_fallback", time.time() - 24 * 3600)
-    return float(ts)
-
-
-def _set_cursor(name: str, newest_ts: Optional[float]) -> None:
-    """记录本次采集到的最新时间戳，供下次增量使用。"""
-    if newest_ts and newest_ts > 0:
-        _CURSORS[name] = float(newest_ts)
 
 
 # ── Collectors ────────────────────────────────────────────────────────────────
 
 def collect_shell_history(n: int = 100) -> str:
-    name = "collect_shell_history"
-    cursor = _get_cursor(name)
+    cfg = get_cfg()
+    cutoff = time.time() - cfg.history_hours * 3600
     try:
         zsh  = Path.home() / ".zsh_history"
         bash = Path.home() / ".bash_history"
@@ -117,7 +78,6 @@ def collect_shell_history(n: int = 100) -> str:
 
         cmds: list[str] = []
         seen: set[str] = set()
-        newest_ts: Optional[float] = None
         has_timestamps = False
 
         for line in reversed(raw):
@@ -136,11 +96,9 @@ def collect_shell_history(n: int = 100) -> str:
                     pass
 
             if ts_val is not None:
-                # 倒序迭代：遇到早于 cursor 的记录即可停止
-                if ts_val <= cursor:
+                # 倒序迭代：遇到早于 cutoff 的记录即可停止
+                if ts_val <= cutoff:
                     break
-                if newest_ts is None or ts_val > newest_ts:
-                    newest_ts = ts_val
 
             cmd = cmd.strip()
             if not cmd or cmd in seen:
@@ -151,7 +109,7 @@ def collect_shell_history(n: int = 100) -> str:
                 break
 
         # 兜底：整个文件无可解析时间戳（bash history 或纯文本格式）
-        # → 回退到原来的取最近 n 条逻辑，不更新 cursor
+        # → 回退到原来的取最近 n 条逻辑
         if not has_timestamps:
             cmds, seen = [], set()
             for line in reversed(raw):
@@ -164,9 +122,6 @@ def collect_shell_history(n: int = 100) -> str:
                 cmds.append(line)
                 if len(cmds) >= n:
                     break
-        else:
-            if newest_ts is not None:
-                _set_cursor(name, newest_ts - 1)
 
         if not cmds:
             return ""
@@ -177,16 +132,14 @@ def collect_shell_history(n: int = 100) -> str:
 
 
 def collect_git_logs(n: int = 20) -> str:
-    name = "collect_git_logs"
-    cursor = _get_cursor(name)
     cfg = get_cfg()
+    cutoff = time.time() - cfg.history_hours * 3600
+    since = datetime.fromtimestamp(cutoff).strftime("%Y-%m-%d %H:%M")
     try:
-        since = datetime.fromtimestamp(cursor).strftime("%Y-%m-%d %H:%M")
         entries, seen_repos = [], set()
-        newest_ts: Optional[float] = None
 
         for root_str in cfg.scan_dirs:
-            root = Path(root_str)
+            root = Path(root_str).expanduser()
             if not root.exists():
                 continue
             for git_dir in root.rglob(".git"):
@@ -215,13 +168,7 @@ def collect_git_logs(n: int = 20) -> str:
                         for raw_line in lines:
                             parts = raw_line.split(" ", 2)
                             if len(parts) == 3:
-                                ts_part, hash_part, subject = parts
-                                try:
-                                    ts_val = float(ts_part)
-                                    if newest_ts is None or ts_val > newest_ts:
-                                        newest_ts = ts_val
-                                except ValueError:
-                                    pass
+                                _, hash_part, subject = parts
                                 display_lines.append(f"  {hash_part[:7]} {subject}")
                             else:
                                 display_lines.append(f"  {raw_line}")
@@ -229,9 +176,6 @@ def collect_git_logs(n: int = 20) -> str:
                                        "\n".join(display_lines))
                 except Exception:
                     continue
-
-        if newest_ts is not None:
-            _set_cursor(name, newest_ts - 1)
 
         if not entries:
             return ""
@@ -242,7 +186,7 @@ def collect_git_logs(n: int = 20) -> str:
 
 
 def collect_clipboard() -> str:
-    # 无状态，不使用 cursor
+    # 无状态，不使用 cutoff
     try:
         from lumina.platform_utils import clipboard_get
         content = clipboard_get().strip()
@@ -257,15 +201,17 @@ def collect_clipboard() -> str:
 
 
 def collect_browser_history(n: int = 50) -> str:
-    import sys as _sys
-    name = "collect_browser_history"
-    cursor = _get_cursor(name)   # Unix 秒
-    cfg = get_cfg()
-    try:
-        results = []
-        newest_ts: Optional[float] = None
+    """采集 Chrome / Firefox / Safari 浏览历史。
 
-        # Chrome — macOS / Windows 路径
+    始终按 history_hours 窗口全量查询，无增量状态。
+    """
+    import sys as _sys
+    cfg = get_cfg()
+    cutoff_unix = time.time() - cfg.history_hours * 3600
+    try:
+        results: list[tuple[float, str]] = []  # (ts_unix, title_or_url)
+
+        # ── Chrome ────────────────────────────────────────────────────────────
         if _sys.platform == "win32":
             chrome_db = (Path.home() / "AppData" / "Local" /
                          "Google" / "Chrome" / "User Data" / "Default" / "History")
@@ -274,10 +220,10 @@ def collect_browser_history(n: int = 50) -> str:
                          "Google" / "Chrome" / "Default" / "History")
         if chrome_db.exists():
             try:
+                chrome_offset = 11644473600 * 1_000_000
+                cutoff_chrome = int(cutoff_unix * 1_000_000 + chrome_offset)
                 uri = chrome_db.as_uri() + "?mode=ro&immutable=1"
                 with sqlite3.connect(uri, uri=True) as conn:
-                    chrome_offset = 11644473600 * 1_000_000
-                    cutoff_chrome = int(cursor * 1_000_000 + chrome_offset)
                     rows = conn.execute(
                         "SELECT title, url, last_visit_time FROM urls "
                         "WHERE last_visit_time > ? "
@@ -285,14 +231,12 @@ def collect_browser_history(n: int = 50) -> str:
                         (cutoff_chrome, n)
                     ).fetchall()
                 for title, url, lv_time in rows:
-                    results.append(title or url)
                     ts_unix = (lv_time - chrome_offset) / 1_000_000
-                    if newest_ts is None or ts_unix > newest_ts:
-                        newest_ts = ts_unix
+                    results.append((ts_unix, title or url))
             except Exception as e:
                 logger.debug("chrome history: %s", e)
 
-        # Firefox — macOS / Windows 路径
+        # ── Firefox ───────────────────────────────────────────────────────────
         if _sys.platform == "win32":
             ff_profiles = Path.home() / "AppData" / "Roaming" / "Mozilla" / "Firefox" / "Profiles"
         else:
@@ -303,9 +247,9 @@ def collect_browser_history(n: int = 50) -> str:
                 if not places_db.exists():
                     continue
                 try:
+                    cutoff_ff = int(cutoff_unix * 1_000_000)
                     uri = places_db.as_uri() + "?mode=ro&immutable=1"
                     with sqlite3.connect(uri, uri=True) as conn:
-                        cutoff_ff = int(cursor * 1_000_000)
                         rows = conn.execute(
                             "SELECT title, url, last_visit_date FROM moz_places "
                             "WHERE last_visit_date > ? "
@@ -313,24 +257,47 @@ def collect_browser_history(n: int = 50) -> str:
                             (cutoff_ff, n)
                         ).fetchall()
                     for title, url, lv_date in rows:
-                        results.append(title or url)
                         if lv_date:
                             ts_unix = lv_date / 1_000_000
-                            if newest_ts is None or ts_unix > newest_ts:
-                                newest_ts = ts_unix
+                            results.append((ts_unix, title or url))
                 except Exception as e:
                     logger.debug("firefox history: %s", e)
 
-        if newest_ts is not None:
-            _set_cursor(name, newest_ts - 1)
+        # ── Safari（仅 macOS）────────────────────────────────────────────────
+        if _sys.platform == "darwin":
+            safari_db = Path.home() / "Library" / "Safari" / "History.db"
+            if safari_db.exists():
+                try:
+                    safari_offset = 978307200  # CoreData epoch
+                    cutoff_safari = cutoff_unix - safari_offset
+                    uri = safari_db.as_uri() + "?mode=ro&immutable=1"
+                    with sqlite3.connect(uri, uri=True) as conn:
+                        rows = conn.execute(
+                            "SELECT hi.url, hv.title, hv.visit_time "
+                            "FROM history_visits hv "
+                            "JOIN history_items hi ON hv.history_item = hi.id "
+                            "WHERE hv.visit_time > ? "
+                            "ORDER BY hv.visit_time DESC LIMIT ?",
+                            (cutoff_safari, n)
+                        ).fetchall()
+                    for url, title, vt in rows:
+                        ts_unix = vt + safari_offset
+                        results.append((ts_unix, title or url))
+                except Exception as e:
+                    logger.debug("safari history: %s", e)
 
         if not results:
             return ""
-        seen, deduped = set(), []
-        for r in results:
-            if r and r not in seen:
-                seen.add(r)
-                deduped.append(f"  {r}")
+
+        # 按时间倒序、去重
+        results.sort(key=lambda x: -x[0])
+        seen: set[str] = set()
+        deduped = []
+        for _, label in results:
+            if label and label not in seen:
+                seen.add(label)
+                deduped.append(f"  {label}")
+
         return "## 浏览器历史（过去 %.0fh）\n" % cfg.history_hours + "\n".join(deduped[:n])
     except Exception as e:
         logger.debug("browser history: %s", e)
@@ -342,23 +309,20 @@ def collect_notes_app() -> str:
 
     macOS TCC 限制：打包后的 .app 需要「完整磁盘访问」才能读取备忘录数据库。
     若权限不足，返回特殊标记 '__PERMISSION_DENIED__'，由 core.py 转为提示信息。
-
-    cursor 存 Unix 秒；查询时转换为 CoreData epoch（cursor - 978307200）。
     """
     import sys as _sys
     if _sys.platform != "darwin":
         return ""
-    name = "collect_notes_app"
-    cursor = _get_cursor(name)   # Unix 秒
     import sqlite3 as _sqlite3
     cfg = get_cfg()
+    cutoff = time.time() - cfg.history_hours * 3600
     try:
         db_path = Path.home() / "Library/Group Containers/group.com.apple.notes/NoteStore.sqlite"
         if not db_path.exists():
             return ""
 
         # CoreData epoch = Unix epoch - 978307200（2001-01-01 与 1970-01-01 的差值）
-        cursor_core = cursor - 978307200
+        cutoff_core = cutoff - 978307200
 
         uri = db_path.as_uri() + "?mode=ro&immutable=1"
         with _sqlite3.connect(uri, uri=True) as conn:
@@ -366,28 +330,19 @@ def collect_notes_app() -> str:
                 "SELECT ZTITLE1, ZSNIPPET, ZMODIFICATIONDATE1 FROM ZICCLOUDSYNCINGOBJECT "
                 "WHERE ZMODIFICATIONDATE1 > ? AND ZTITLE1 IS NOT NULL "
                 "ORDER BY ZMODIFICATIONDATE1 DESC LIMIT 20",
-                (cursor_core,),
+                (cutoff_core,),
             ).fetchall()
 
         if not rows:
             return ""
 
-        newest_ts: Optional[float] = None
         entries = []
         for title, snippet, mod_date in rows:
-            if mod_date is not None:
-                ts_unix = float(mod_date) + 978307200
-                if newest_ts is None or ts_unix > newest_ts:
-                    newest_ts = ts_unix
             snippet_text = (snippet or "").strip()[:200]
             if snippet_text:
                 entries.append(f"**{title}**:\n  {snippet_text}")
             else:
                 entries.append(f"**{title}**")
-
-        # cursor 退 1 秒，防止同一秒内其他修改因 mtime == cursor 被严格大于过滤掉
-        if newest_ts is not None:
-            _set_cursor(name, newest_ts - 1)
 
         return f"## 备忘录（过去 {cfg.history_hours:.0f}h 修改）\n" + "\n\n".join(entries)
     except PermissionError:
@@ -405,7 +360,7 @@ _CALENDAR_CORE_OFFSET = 978307200  # CoreData epoch = Unix epoch - 978307200
 def collect_calendar() -> str:
     """读取 macOS Calendar，返回今天及未来 history_hours 内的日程（仅 macOS）。
 
-    无 cursor：日历事件按时间窗口查，不存在「只读新事件」的语义。
+    无状态：日历事件按时间窗口查，每次全量读取当前窗口。
     需要完整磁盘访问权限（与 Notes.app 同理）。
     """
     import sys as _sys
@@ -480,18 +435,17 @@ def collect_markdown_notes() -> str:
     """扫描 scan_dirs 下最近修改的 .md 文件。
 
     两级过滤：
-    1. mtime > cursor（快速跳过明显旧文件）
+    1. mtime > cutoff（快速跳过明显旧文件）
     2. md5(前4KB) 与上次采集不同（过滤 Cursor/iCloud 等 mtime-only 误触发）
     """
-    name = "collect_markdown_notes"
-    cursor = _get_cursor(name)
     cfg = get_cfg()
+    cutoff = time.time() - cfg.history_hours * 3600
     try:
         hashes = load_md_hashes()
         candidates: list[tuple[float, Path]] = []
 
         for root_str in cfg.scan_dirs:
-            root = Path(root_str)
+            root = Path(root_str).expanduser()
             if not root.exists():
                 continue
             for md in root.rglob("*.md"):
@@ -500,7 +454,7 @@ def collect_markdown_notes() -> str:
                     continue
                 try:
                     mtime = md.stat().st_mtime
-                    if mtime <= cursor:
+                    if mtime <= cutoff:
                         continue
                     # mtime 有变化，再用 md5 确认内容是否真的改了
                     key = str(md)
@@ -523,7 +477,6 @@ def collect_markdown_notes() -> str:
             return ""
 
         candidates.sort(key=lambda x: -x[0])
-        newest_ts = candidates[0][0]
 
         entries = []
         for mtime, md, _ in candidates[:10]:
@@ -534,13 +487,11 @@ def collect_markdown_notes() -> str:
             except Exception:
                 continue
 
-        # 只有真正产出内容后才推进 hash 和 cursor，避免临时 IO 失败导致文件被永久跳过
+        # 只有真正产出内容后才推进 hash，避免临时 IO 失败导致文件被永久跳过
         if entries:
             for _, md, current_hash in candidates:
                 hashes[str(md)] = current_hash
             save_md_hashes(hashes)
-            # cursor 退 1 秒，防止同一秒内其他文件在下次采集时因 mtime == cursor 被过滤
-            _set_cursor(name, newest_ts - 1)
 
         if not entries:
             return ""
@@ -552,17 +503,10 @@ def collect_markdown_notes() -> str:
 
 def collect_ai_queries(n: int = 50) -> str:
     """从 Claude Code、Codex、Cursor 本地历史中提取用户最近的提问。"""
-    name = "collect_ai_queries"
-    cursor = _get_cursor(name)   # Unix 秒
     cfg = get_cfg()
+    cutoff = time.time() - cfg.history_hours * 3600
     try:
         queries: list[tuple[float, str]] = []
-        newest_ts: Optional[float] = None
-
-        def _update_newest(ts: float) -> None:
-            nonlocal newest_ts
-            if ts and ts > 0 and (newest_ts is None or ts > newest_ts):
-                newest_ts = ts
 
         # ── Claude Code: history.jsonl（display 字段）─────────────────────────
         history_file = Path.home() / ".claude" / "history.jsonl"
@@ -579,12 +523,11 @@ def collect_ai_queries(n: int = 50) -> str:
                         continue
                     ts_ms = obj.get("timestamp")
                     ts = ts_ms / 1000 if ts_ms else 0.0
-                    if ts and ts <= cursor:
+                    if ts and ts <= cutoff:
                         break
                     text = obj.get("display", "").strip()
                     if text:
                         queries.append((ts, text))
-                        _update_newest(ts)
                     if len(queries) >= n:
                         break
             except Exception as e:
@@ -600,7 +543,7 @@ def collect_ai_queries(n: int = 50) -> str:
                     reverse=True,
                 )[:20]
                 for jf in jsonl_files:
-                    if jf.stat().st_mtime <= cursor:
+                    if jf.stat().st_mtime <= cutoff:
                         continue
                     try:
                         lines = jf.read_text(errors="replace").splitlines()
@@ -623,7 +566,7 @@ def collect_ai_queries(n: int = 50) -> str:
                             ).timestamp()
                         except Exception:
                             ts = 0.0
-                        if ts and ts <= cursor:
+                        if ts and ts <= cutoff:
                             continue
                         content = obj.get("message", {}).get("content", "")
                         if isinstance(content, list):
@@ -636,7 +579,6 @@ def collect_ai_queries(n: int = 50) -> str:
                         if (content and len(content) < 2000
                                 and not any(content.startswith(p) for p in _skip_prefixes)):
                             queries.append((ts, content))
-                            _update_newest(ts)
             except Exception as e:
                 logger.debug("claude projects jsonl: %s", e)
 
@@ -654,12 +596,11 @@ def collect_ai_queries(n: int = 50) -> str:
                     except Exception:
                         continue
                     ts = float(obj.get("ts", 0))
-                    if ts and ts <= cursor:
+                    if ts and ts <= cutoff:
                         break
                     text = obj.get("text", "").strip()
                     if text:
                         queries.append((ts, text))
-                        _update_newest(ts)
                     if len(queries) >= n:
                         break
             except Exception as e:
@@ -667,12 +608,12 @@ def collect_ai_queries(n: int = 50) -> str:
 
         # ── Cursor: state.vscdb（bubbleId:* 条目）────────────────────────────
         # Cursor IDE 气泡无可靠时间戳；用 DB 文件 mtime 作为代理。
-        # 若 mtime <= cursor，说明 DB 自上次采集后未更新，跳过。
+        # 若 mtime <= cutoff，说明 DB 自 cutoff 时间窗口内未更新，跳过。
         cursor_db = (Path.home() / "Library" / "Application Support" /
                      "Cursor" / "User" / "globalStorage" / "state.vscdb")
         if cursor_db.exists():
             db_mtime = cursor_db.stat().st_mtime
-            if db_mtime > cursor:
+            if db_mtime > cutoff:
                 tmp_fd3, tmp_str3 = tempfile.mkstemp(suffix=".db", prefix="lumina_cursor_")
                 tmp = Path(tmp_str3)
                 try:
@@ -700,14 +641,10 @@ def collect_ai_queries(n: int = 50) -> str:
                                 queries.append((db_mtime, text))
                         except Exception:
                             continue
-                    _update_newest(db_mtime)
                 except Exception as e:
                     logger.debug("cursor state.vscdb: %s", e)
                 finally:
                     tmp.unlink(missing_ok=True)
-
-        if newest_ts is not None:
-            _set_cursor(name, newest_ts - 1)
 
         if not queries:
             return ""

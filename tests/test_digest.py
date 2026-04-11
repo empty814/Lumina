@@ -61,56 +61,6 @@ def test_digest_config_scan_dirs_missing_uses_defaults():
     assert get_cfg().scan_dirs == DigestConfig().scan_dirs
 
 
-# ── cursor_store ──────────────────────────────────────────────────────────────
-
-def test_cursor_store_roundtrip(tmp_path):
-    from lumina.digest import cursor_store
-    original_path = cursor_store.CURSOR_PATH
-    cursor_store.CURSOR_PATH = tmp_path / "cursors.json"
-    try:
-        data = {"collect_shell_history": 1700000000.0, "collect_git_logs": 1700001000.0}
-        cursor_store.save_cursors(data)
-        loaded = cursor_store.load_cursors()
-        assert loaded == data
-    finally:
-        cursor_store.CURSOR_PATH = original_path
-
-
-def test_cursor_store_missing_file_returns_empty(tmp_path):
-    from lumina.digest import cursor_store
-    original_path = cursor_store.CURSOR_PATH
-    cursor_store.CURSOR_PATH = tmp_path / "nonexistent.json"
-    try:
-        assert cursor_store.load_cursors() == {}
-    finally:
-        cursor_store.CURSOR_PATH = original_path
-
-
-def test_cursor_store_corrupted_file_returns_empty(tmp_path):
-    from lumina.digest import cursor_store
-    p = tmp_path / "cursors.json"
-    p.write_text("not json")
-    original_path = cursor_store.CURSOR_PATH
-    cursor_store.CURSOR_PATH = p
-    try:
-        assert cursor_store.load_cursors() == {}
-    finally:
-        cursor_store.CURSOR_PATH = original_path
-
-
-def test_cursor_store_atomic_write(tmp_path):
-    """原子写入：tmp 文件写完后 rename，不应留下 .tmp 文件。"""
-    from lumina.digest import cursor_store
-    original_path = cursor_store.CURSOR_PATH
-    cursor_store.CURSOR_PATH = tmp_path / "cursors.json"
-    try:
-        cursor_store.save_cursors({"x": 1.0})
-        assert cursor_store.CURSOR_PATH.exists()
-        assert not cursor_store.CURSOR_PATH.with_suffix(".tmp").exists()
-    finally:
-        cursor_store.CURSOR_PATH = original_path
-
-
 # ── md5_of_file ───────────────────────────────────────────────────────────────
 
 def test_md5_of_file(tmp_path):
@@ -137,50 +87,29 @@ def test_md5_of_file_missing_returns_stable_value(tmp_path):
     assert result != md5_of_file(real)
 
 
-# ── collectors._get_cursor / _set_cursor ─────────────────────────────────────
+# ── md_hashes roundtrip ────────────────────────────────────────────────────────
 
-def test_get_cursor_uses_fallback():
-    import lumina.digest.collectors as c
-    now = time.time()
-    c._CURSORS = {"_fallback": now - 3600}
-    ts = c._get_cursor("collect_shell_history")
-    assert abs(ts - (now - 3600)) < 1
-
-
-def test_get_cursor_uses_own_cursor():
-    import lumina.digest.collectors as c
-    ts_own = time.time() - 100
-    c._CURSORS = {"collect_shell_history": ts_own, "_fallback": time.time() - 3600}
-    assert c._get_cursor("collect_shell_history") == ts_own
+def test_md_hashes_roundtrip(tmp_path):
+    from lumina.digest import cursor_store
+    original_path = cursor_store.MD_HASHES_PATH
+    cursor_store.MD_HASHES_PATH = tmp_path / "md_hashes.json"
+    try:
+        data = {"/some/file.md": "abc123", "/other/note.md": "def456"}
+        cursor_store.save_md_hashes(data)
+        loaded = cursor_store.load_md_hashes()
+        assert loaded == data
+    finally:
+        cursor_store.MD_HASHES_PATH = original_path
 
 
-def test_set_cursor_updates_dict():
-    import lumina.digest.collectors as c
-    c._CURSORS = {}
-    ts = time.time()
-    c._set_cursor("collect_git_logs", ts)
-    assert c._CURSORS["collect_git_logs"] == ts
-
-
-def test_set_cursor_ignores_zero():
-    import lumina.digest.collectors as c
-    c._CURSORS = {}
-    c._set_cursor("collect_git_logs", 0)
-    assert "collect_git_logs" not in c._CURSORS
-
-
-def test_set_cursor_with_none_newest_ts_does_not_raise():
-    """Fix #2：newest_ts=None 时调用 newest_ts - 1 会 TypeError；
-    正确做法是 if newest_ts is not None 守卫，不写回 cursor。"""
-    import lumina.digest.collectors as c
-    c._CURSORS = {"_fallback": time.time() - 3600}
-    before = dict(c._CURSORS)
-    # 模拟 collector 内 newest_ts=None 时应走的路径：不调用 _set_cursor
-    newest_ts = None
-    if newest_ts is not None:
-        c._set_cursor("collect_shell_history", newest_ts - 1)
-    # cursor 字典不应被修改
-    assert c._CURSORS == before
+def test_md_hashes_missing_file_returns_empty(tmp_path):
+    from lumina.digest import cursor_store
+    original_path = cursor_store.MD_HASHES_PATH
+    cursor_store.MD_HASHES_PATH = tmp_path / "nonexistent.json"
+    try:
+        assert cursor_store.load_md_hashes() == {}
+    finally:
+        cursor_store.MD_HASHES_PATH = original_path
 
 
 # ── enabled_collectors 过滤 ────────────────────────────────────────────────────
@@ -206,9 +135,7 @@ def test_enabled_collectors_filters_active():
 
     try:
         import asyncio
-        with patch("lumina.digest.cursor_store.load_cursors", return_value={}), \
-             patch("lumina.digest.cursor_store.save_cursors"):
-            asyncio.run(core._collect_all())
+        asyncio.run(core._collect_all())
         assert called == ["collect_shell_history"]  # git_logs 被过滤掉
     finally:
         core._COLLECTORS = original
@@ -383,50 +310,3 @@ async def test_maybe_generate_digest_skips_when_disabled():
         mocked_generate.assert_not_called()
     finally:
         configure({"digest": {"enabled": True}})
-
-
-# ── changelog 精确匹配（Fix #8）─────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_generate_changelog_no_write_when_exact_no_change_phrase(tmp_path):
-    """Fix #8：changelog 返回「（无显著变化）」时不应写文件（精确匹配，非子串匹配）。"""
-    import lumina.digest.core as core
-
-    class FakeLLM:
-        async def generate(self, *args, **kwargs):
-            return "（无显著变化）"
-
-    digest_path = tmp_path / "digest.md"
-    original_path = core._DIGEST_PATH
-    core._DIGEST_PATH = digest_path
-    core._last_generated_ts = time.time() - 60
-    try:
-        result = await core.generate_changelog(FakeLLM())
-        assert result is None
-        assert not digest_path.exists()
-    finally:
-        core._DIGEST_PATH = original_path
-        core._generating = False
-
-
-@pytest.mark.asyncio
-async def test_generate_changelog_does_write_when_substantial_change(tmp_path):
-    """changelog 有实质内容时应写文件并返回 entry。"""
-    import lumina.digest.core as core
-
-    class FakeLLM:
-        async def generate(self, *args, **kwargs):
-            return "完成了登录模块重构，修复了 JWT 过期 bug。"
-
-    digest_path = tmp_path / "digest.md"
-    original_path = core._DIGEST_PATH
-    core._DIGEST_PATH = digest_path
-    core._last_generated_ts = time.time() - 60
-    try:
-        result = await core.generate_changelog(FakeLLM())
-        assert result is not None
-        assert digest_path.exists()
-        assert "登录模块" in digest_path.read_text(encoding="utf-8")
-    finally:
-        core._DIGEST_PATH = original_path
-        core._generating = False
