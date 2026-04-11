@@ -56,6 +56,29 @@ def _is_digest_enabled() -> bool:
     return bool(get_cfg().enabled)
 
 
+def _persist_ptt_enabled(enabled: bool, config_path: str | None = None) -> None:
+    """将 ptt.enabled 持久化到用户配置（~/.lumina/config.json）。"""
+    target = _USER_CONFIG_PATH
+    source = Path(config_path) if config_path else (Path(__file__).parent / "config.json")
+    data = {}
+    if target.exists():
+        with open(target, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    elif source.exists():
+        with open(source, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+    ptt_cfg = data.get("ptt")
+    if not isinstance(ptt_cfg, dict):
+        ptt_cfg = {}
+    ptt_cfg["enabled"] = bool(enabled)
+    data["ptt"] = ptt_cfg
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(target, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
 def _persist_digest_enabled(enabled: bool, config_path: str | None = None) -> None:
     """
     将 digest.enabled 持久化到用户配置（~/.lumina/config.json）。
@@ -580,23 +603,21 @@ def _run_with_menubar(fastapi_app, cfg, llm, config_path: str | None = None):
     ]
     _icon_path = next((str(p) for p in _icon_candidates if p and p.exists()), None)
 
-    _PAUSE_LABEL  = "暂停语音识别"
-    _RESUME_LABEL = "恢复语音识别"
-
     class LuminaApp(rumps.App):
         def __init__(self):
             super().__init__(title, icon=_icon_path, quit_button=None, template=False)
             self._ptt_ref: list = []   # _start_ptt 启动后写入
             self._digest_toggle_item = rumps.MenuItem("", callback=self._toggle_digest)
             self._refresh_digest_menu_label()
+            self._ptt_toggle_item = rumps.MenuItem("", callback=self._toggle_ptt)
+            self._refresh_ptt_menu_label()
             self._ip_item = rumps.MenuItem("", callback=self._copy_ip)
             self._refresh_ip_label()
             self.menu = [
                 rumps.MenuItem("打开界面", callback=self._open_ui),
                 self._ip_item,
                 self._digest_toggle_item,
-                None,  # 分隔线
-                rumps.MenuItem(_PAUSE_LABEL, callback=self._toggle_ptt),
+                self._ptt_toggle_item,
                 None,
                 rumps.MenuItem("重启服务", callback=self._restart),
                 rumps.MenuItem("退出 Lumina", callback=self._quit),
@@ -618,6 +639,33 @@ def _run_with_menubar(fastapi_app, cfg, llm, config_path: str | None = None):
                 logger.error("Failed to persist digest toggle: %s", e)
             self._refresh_digest_menu_label()
             logger.info("Digest toggled via menubar: enabled=%s", enabled)
+
+        def _refresh_ptt_menu_label(self):
+            if not self._ptt_ref:
+                self._ptt_toggle_item.title = "启用语音识别"
+            else:
+                ptt = self._ptt_ref[0]
+                self._ptt_toggle_item.title = "恢复语音识别" if ptt.paused else "暂停语音识别"
+
+        def _toggle_ptt(self, _):
+            if not self._ptt_ref:
+                # PTT 未运行 → 启用并写入配置
+                try:
+                    cfg.ptt.enabled = True
+                    _persist_ptt_enabled(True, config_path=config_path)
+                except Exception as e:
+                    logger.error("Failed to persist ptt toggle: %s", e)
+                ptt_ref = _start_ptt(cfg, menubar_app=self)
+                if ptt_ref is not None:
+                    self._ptt_ref = ptt_ref
+                logger.info("PTT enabled via menubar")
+            else:
+                ptt = self._ptt_ref[0]
+                if ptt.paused:
+                    ptt.resume()
+                else:
+                    ptt.pause()
+            self._refresh_ptt_menu_label()
 
         def _get_local_ip(self) -> str:
             import socket
@@ -644,17 +692,6 @@ def _run_with_menubar(fastapi_app, cfg, llm, config_path: str | None = None):
             import subprocess
             subprocess.Popen(["open", f"http://127.0.0.1:{cfg.port}"])
 
-        def _toggle_ptt(self, sender):
-            if not self._ptt_ref:
-                return
-            ptt = self._ptt_ref[0]
-            if ptt.paused:
-                ptt.resume()
-                sender.title = _PAUSE_LABEL
-            else:
-                ptt.pause()
-                sender.title = _RESUME_LABEL
-
         def _restart(self, _):
             server.should_exit = True
             t.join(timeout=5)
@@ -673,7 +710,10 @@ def _run_with_menubar(fastapi_app, cfg, llm, config_path: str | None = None):
     try:
         app = LuminaApp()
         ptt_ref = _start_ptt(cfg, menubar_app=app)
-        app._ptt_ref = ptt_ref
+        # _start_ptt 在 ptt.enabled=false 时返回 None；保持 _ptt_ref 为 list 类型
+        if ptt_ref is not None:
+            app._ptt_ref = ptt_ref
+            app._refresh_ptt_menu_label()
         app.run()
     finally:
         server.should_exit = True

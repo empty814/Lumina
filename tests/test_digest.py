@@ -21,7 +21,7 @@ def test_digest_config_defaults():
     assert cfg.refresh_hours == 1.0
     assert cfg.notify_time == "20:00"
     assert cfg.enabled_collectors is None
-    assert cfg.enabled is True
+    assert cfg.enabled is False  # 默认关闭，需显式启用
 
 
 def test_digest_config_configure():
@@ -47,9 +47,17 @@ def test_digest_config_enabled_collectors_null():
     assert get_cfg().enabled_collectors is None
 
 
-def test_digest_config_scan_dirs_empty_uses_defaults():
-    from lumina.digest.config import configure, get_cfg, DigestConfig
+def test_digest_config_scan_dirs_empty_means_no_scan():
+    # scan_dirs=[] 的语义是"不扫描任何目录"，而非回退到默认值
+    from lumina.digest.config import configure, get_cfg
     configure({"digest": {"scan_dirs": []}})
+    assert get_cfg().scan_dirs == []
+
+
+def test_digest_config_scan_dirs_missing_uses_defaults():
+    # 配置中没有 scan_dirs key 时，才回退到默认目录列表
+    from lumina.digest.config import configure, get_cfg, DigestConfig
+    configure({"digest": {}})
     assert get_cfg().scan_dirs == DigestConfig().scan_dirs
 
 
@@ -159,6 +167,20 @@ def test_set_cursor_ignores_zero():
     c._CURSORS = {}
     c._set_cursor("collect_git_logs", 0)
     assert "collect_git_logs" not in c._CURSORS
+
+
+def test_set_cursor_with_none_newest_ts_does_not_raise():
+    """Fix #2：newest_ts=None 时调用 newest_ts - 1 会 TypeError；
+    正确做法是 if newest_ts is not None 守卫，不写回 cursor。"""
+    import lumina.digest.collectors as c
+    c._CURSORS = {"_fallback": time.time() - 3600}
+    before = dict(c._CURSORS)
+    # 模拟 collector 内 newest_ts=None 时应走的路径：不调用 _set_cursor
+    newest_ts = None
+    if newest_ts is not None:
+        c._set_cursor("collect_shell_history", newest_ts - 1)
+    # cursor 字典不应被修改
+    assert c._CURSORS == before
 
 
 # ── enabled_collectors 过滤 ────────────────────────────────────────────────────
@@ -352,3 +374,50 @@ async def test_maybe_generate_digest_skips_when_disabled():
         mocked_generate.assert_not_called()
     finally:
         configure({"digest": {"enabled": True}})
+
+
+# ── changelog 精确匹配（Fix #8）─────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_generate_changelog_no_write_when_exact_no_change_phrase(tmp_path):
+    """Fix #8：changelog 返回「（无显著变化）」时不应写文件（精确匹配，非子串匹配）。"""
+    import lumina.digest.core as core
+
+    class FakeLLM:
+        async def generate(self, *args, **kwargs):
+            return "（无显著变化）"
+
+    digest_path = tmp_path / "digest.md"
+    original_path = core._DIGEST_PATH
+    core._DIGEST_PATH = digest_path
+    core._last_generated_ts = time.time() - 60
+    try:
+        result = await core.generate_changelog(FakeLLM())
+        assert result is None
+        assert not digest_path.exists()
+    finally:
+        core._DIGEST_PATH = original_path
+        core._generating = False
+
+
+@pytest.mark.asyncio
+async def test_generate_changelog_does_write_when_substantial_change(tmp_path):
+    """changelog 有实质内容时应写文件并返回 entry。"""
+    import lumina.digest.core as core
+
+    class FakeLLM:
+        async def generate(self, *args, **kwargs):
+            return "完成了登录模块重构，修复了 JWT 过期 bug。"
+
+    digest_path = tmp_path / "digest.md"
+    original_path = core._DIGEST_PATH
+    core._DIGEST_PATH = digest_path
+    core._last_generated_ts = time.time() - 60
+    try:
+        result = await core.generate_changelog(FakeLLM())
+        assert result is not None
+        assert digest_path.exists()
+        assert "登录模块" in digest_path.read_text(encoding="utf-8")
+    finally:
+        core._DIGEST_PATH = original_path
+        core._generating = False

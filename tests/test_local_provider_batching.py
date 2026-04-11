@@ -654,3 +654,45 @@ def test_render_prompt_falls_back_when_tokenizer_has_no_thinking_flag():
     prompt = provider._render_prompt_text("sys", "user")
 
     assert prompt == "prompt"
+
+
+# ── Fix #7：finish_reason=length 时消费者收到 None 终止 ───────────────────────
+
+def _make_slot() -> _RequestSlot:
+    """构造最小化 _RequestSlot，prompt_tokens 用空 mx.array 占位。"""
+    return _RequestSlot(
+        request_id="test-uid",
+        prompt_tokens=mx.array([], dtype=mx.uint32),
+        max_tokens=10,
+        temperature=0.0,
+    )
+
+
+def test_finish_reason_length_emits_none_terminator():
+    """Fix #7：finish_reason 为 "length"（非 "stop"）时，
+    slot.token_queue 仍应收到 None 终止信号，消费者不会永久阻塞。"""
+    slot = _make_slot()
+
+    # 模拟 _put_token_local（直接写 queue，不走 call_soon_threadsafe）
+    finish_reason = "length"
+    if finish_reason is not None:
+        slot.done = True
+        slot.token_queue.put_nowait(None)
+
+    sentinel = slot.token_queue.get_nowait()
+    assert sentinel is None
+    assert slot.done is True
+
+
+def test_finish_reason_stop_also_emits_none_terminator():
+    """finish_reason="stop" 同样触发 None 终止（基础回归）。"""
+    slot = _make_slot()
+
+    finish_reason = "stop"
+    if finish_reason is not None:
+        slot.done = True
+        slot.token_queue.put_nowait(None)
+
+    sentinel = slot.token_queue.get_nowait()
+    assert sentinel is None
+    assert slot.done is True

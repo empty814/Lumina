@@ -199,9 +199,10 @@ async def _collect_all(since_ts: Optional[float] = None) -> str:
     for fn, r in zip(active, results):
         name = fn.__name__
         if isinstance(r, Exception):
-            import traceback
+            # 直接用 str(r)；_run_with_timeout 返回的是普通 Exception 对象，
+            # 此处没有活跃异常上下文，traceback.format_exc() 只会得到空栈。
             cache[name] = {"chars": 0, "lines": 0, "preview": None,
-                           "error": traceback.format_exc()}
+                           "error": str(r)}
         else:
             text = r or ""
             if text == "__PERMISSION_DENIED__":

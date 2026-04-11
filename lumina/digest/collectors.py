@@ -62,9 +62,11 @@ cursor 存储在 ~/.lumina/collector_cursors.json，由 cursor_store.py 管理�
 """
 import json
 import logging
+import os
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -271,7 +273,12 @@ def collect_browser_history(n: int = 50) -> str:
             chrome_db = (Path.home() / "Library" / "Application Support" /
                          "Google" / "Chrome" / "Default" / "History")
         if chrome_db.exists():
-            tmp = Path("/tmp/lumina_chrome_history.db")
+            tmp_fd, tmp_str = tempfile.mkstemp(suffix=".db", prefix="lumina_chrome_")
+            tmp = Path(tmp_str)
+            try:
+                os.close(tmp_fd)
+            except OSError:
+                pass
             shutil.copy2(str(chrome_db), str(tmp))
             try:
                 conn = sqlite3.connect(str(tmp))
@@ -304,7 +311,12 @@ def collect_browser_history(n: int = 50) -> str:
                 places_db = profile_dir / "places.sqlite"
                 if not places_db.exists():
                     continue
-                tmp = Path("/tmp/lumina_ff_places.db")
+                tmp_fd2, tmp_str2 = tempfile.mkstemp(suffix=".db", prefix="lumina_ff_")
+                tmp = Path(tmp_str2)
+                try:
+                    os.close(tmp_fd2)
+                except OSError:
+                    pass
                 shutil.copy2(str(places_db), str(tmp))
                 try:
                     conn = sqlite3.connect(str(tmp))
@@ -368,7 +380,8 @@ def collect_notes_app() -> str:
         cursor_core = cursor - 978307200
 
         import shutil as _shutil
-        tmp_db = Path("/tmp/lumina_notes.db")
+        tmp_dir = tempfile.mkdtemp(prefix="lumina_notes_")
+        tmp_db = Path(tmp_dir) / "notes.db"
         _shutil.copy2(str(db_path), str(tmp_db))
         # 必须同时复制 WAL / SHM，否则 Notes.app 写入的未 checkpoint 数据会丢失
         for suffix in ("-wal", "-shm"):
@@ -388,7 +401,7 @@ def collect_notes_app() -> str:
         )
         rows = cur.fetchall()
         conn.close()
-        tmp_db.unlink(missing_ok=True)
+        _shutil.rmtree(tmp_dir, ignore_errors=True)
 
         if not rows:
             return ""
@@ -437,7 +450,8 @@ def collect_calendar() -> str:
         if not _CALENDAR_DB.exists():
             return ""
 
-        tmp_db = Path("/tmp/lumina_calendar.db")
+        tmp_cal_dir = tempfile.mkdtemp(prefix="lumina_calendar_")
+        tmp_db = Path(tmp_cal_dir) / "calendar.db"
         shutil.copy2(str(_CALENDAR_DB), str(tmp_db))
         for suffix in ("-wal", "-shm"):
             src = _CALENDAR_DB.with_name(_CALENDAR_DB.name + suffix)
@@ -473,7 +487,7 @@ def collect_calendar() -> str:
             (window_start, window_end),
         ).fetchall()
         conn.close()
-        tmp_db.unlink(missing_ok=True)
+        shutil.rmtree(tmp_cal_dir, ignore_errors=True)
 
         if not rows:
             return ""
@@ -706,7 +720,12 @@ def collect_ai_queries(n: int = 50) -> str:
         if cursor_db.exists():
             db_mtime = cursor_db.stat().st_mtime
             if db_mtime > cursor:
-                tmp = Path("/tmp/lumina_cursor_state.db")
+                tmp_fd3, tmp_str3 = tempfile.mkstemp(suffix=".db", prefix="lumina_cursor_")
+                tmp = Path(tmp_str3)
+                try:
+                    os.close(tmp_fd3)
+                except OSError:
+                    pass
                 try:
                     shutil.copy2(str(cursor_db), str(tmp))
                     conn = sqlite3.connect(str(tmp))

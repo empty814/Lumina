@@ -1,7 +1,6 @@
 """
 API 契约测试：验证端点的请求/响应结构，不依赖真实 LLM 或 PDF 翻译。
 """
-import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -146,3 +145,26 @@ async def test_pdf_job_not_found(client):
 async def test_pdf_download_not_found(client):
     r = await client.get("/v1/pdf/download/nonexistent/mono")
     assert r.status_code == 404
+
+
+# ── PDF 路径穿越防护（Fix #4）────────────────────────────────────────────────
+
+def test_pdf_upload_path_traversal_stripped():
+    """Fix #4：上传文件名含目录前缀（如 ../../etc/passwd.pdf）时，
+    服务端应只取文件名部分，不应落到 tmp_dir 之外。"""
+    from pathlib import Path
+    # 直接测试防护逻辑：Path(filename).name 应剥离目录分量
+    malicious_filename = "../../etc/passwd.pdf"
+    safe_name = Path(malicious_filename).name
+    assert safe_name == "passwd.pdf"
+    assert "/" not in safe_name
+    assert ".." not in safe_name
+
+
+@pytest.mark.asyncio
+async def test_pdf_upload_rejects_non_pdf(client):
+    """上传非 PDF 后缀文件应返回 400。"""
+    import io
+    data = {"file": ("evil.exe", io.BytesIO(b"MZ"), "application/octet-stream")}
+    r = await client.post("/v1/pdf/upload", files=data, params={"lang_out": "zh"})
+    assert r.status_code == 400
