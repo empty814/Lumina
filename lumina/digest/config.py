@@ -62,7 +62,8 @@ def configure(data: dict) -> None:
     global _cfg
     d = data.get("digest", {})
     _cfg = DigestConfig(
-        scan_dirs=d.get("scan_dirs") or DigestConfig().scan_dirs,
+        # 用 key 存在性而非真值判断：scan_dirs=[] 是"不扫描任何目录"，不能回退到默认值
+        scan_dirs=d["scan_dirs"] if "scan_dirs" in d else DigestConfig().scan_dirs,
         history_hours=float(d.get("history_hours", 24.0)),
         refresh_hours=float(d.get("refresh_hours", 1.0)),
         notify_time=str(d.get("notify_time", "20:00")),

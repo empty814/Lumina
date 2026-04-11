@@ -164,7 +164,7 @@ def create_app(llm: LLMEngine, transcriber: Transcriber) -> FastAPI:
         if not file.filename.lower().endswith(".pdf"):
             raise HTTPException(400, "仅支持 PDF 文件")
         tmp_dir = tempfile.mkdtemp(prefix="lumina_")
-        pdf_path = str(Path(tmp_dir) / file.filename)
+        pdf_path = str(Path(tmp_dir) / Path(file.filename).name)
         Path(pdf_path).write_bytes(await file.read())
 
         job_id = uuid.uuid4().hex
@@ -215,7 +215,7 @@ def create_app(llm: LLMEngine, transcriber: Transcriber) -> FastAPI:
         if not file.filename.lower().endswith(".pdf"):
             raise HTTPException(400, "仅支持 PDF 文件")
         tmp_dir = tempfile.mkdtemp(prefix="lumina_")
-        pdf_path = str(Path(tmp_dir) / file.filename)
+        pdf_path = str(Path(tmp_dir) / Path(file.filename).name)
         Path(pdf_path).write_bytes(await file.read())
         return StreamingResponse(
             _extract_and_stream_summary(pdf_path),
@@ -427,7 +427,12 @@ def create_app(llm: LLMEngine, transcriber: Transcriber) -> FastAPI:
 
     @app.get("/v1/digest/debug")
     async def digest_debug_api():
-        """返回上次采集的缓存数据，立即返回，不触发新的采集。"""
+        """本地调试接口（非面向最终用户）：返回上次采集的缓存数据，立即返回，不触发新的采集。
+
+        响应包含 scan_dirs、collector 详情、cursor 时间戳及 md_files 路径列表，
+        属于本机敏感信息。仅供本地诊断使用；若 Lumina 绑定 0.0.0.0 对局域网开放，
+        需自行评估此接口的暴露风险（考虑添加鉴权或在生产环境禁用）。
+        """
         from lumina.digest.core import get_debug_info
         return get_debug_info()
 
@@ -468,6 +473,6 @@ async def _delayed_rmtree(path: str, delay: int = 300):
 async def raw_request_disconnected(request) -> bool:
     """辅助函数，检查客户端是否断开（流式场景）。"""
     try:
-        return await asyncio.wait_for(request.is_disconnected(), timeout=0)
+        return await asyncio.wait_for(request.is_disconnected(), timeout=0.001)
     except Exception:
         return False

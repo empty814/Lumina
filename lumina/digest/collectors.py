@@ -163,7 +163,8 @@ def collect_shell_history(n: int = 100) -> str:
                 if len(cmds) >= n:
                     break
         else:
-            _set_cursor(name, newest_ts - 1)
+            if newest_ts is not None:
+                _set_cursor(name, newest_ts - 1)
 
         if not cmds:
             return ""
@@ -227,7 +228,8 @@ def collect_git_logs(n: int = 20) -> str:
                 except Exception:
                     continue
 
-        _set_cursor(name, newest_ts - 1)
+        if newest_ts is not None:
+            _set_cursor(name, newest_ts - 1)
 
         if not entries:
             return ""
@@ -326,7 +328,8 @@ def collect_browser_history(n: int = 50) -> str:
                     tmp.unlink(missing_ok=True)
                 break  # 只处理第一个 profile
 
-        _set_cursor(name, newest_ts - 1)
+        if newest_ts is not None:
+            _set_cursor(name, newest_ts - 1)
 
         if not results:
             return ""
@@ -404,7 +407,8 @@ def collect_notes_app() -> str:
                 entries.append(f"**{title}**")
 
         # cursor 退 1 秒，防止同一秒内其他修改因 mtime == cursor 被严格大于过滤掉
-        _set_cursor(name, newest_ts - 1)
+        if newest_ts is not None:
+            _set_cursor(name, newest_ts - 1)
 
         return f"## 备忘录（过去 {cfg.history_hours:.0f}h 修改）\n" + "\n\n".join(entries)
     except PermissionError:
@@ -568,7 +572,8 @@ def collect_markdown_notes() -> str:
 
         save_md_hashes(hashes)
         # cursor 退 1 秒，防止同一秒内其他文件在下次采集时因 mtime == cursor 被过滤
-        _set_cursor(name, newest_ts - 1)
+        if newest_ts is not None:
+            _set_cursor(name, newest_ts - 1)
 
         if not entries:
             return ""
@@ -730,7 +735,8 @@ def collect_ai_queries(n: int = 50) -> str:
                 finally:
                     tmp.unlink(missing_ok=True)
 
-        _set_cursor(name, newest_ts - 1)
+        if newest_ts is not None:
+            _set_cursor(name, newest_ts - 1)
 
         if not queries:
             return ""

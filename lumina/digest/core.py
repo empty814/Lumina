@@ -1,5 +1,46 @@
 """
 lumina/digest/core.py — 摘要生成、增量检测、状态管理
+
+──────────────────────────────────────────────────────────────────────────────
+Digest 机制说明（状态机）
+──────────────────────────────────────────────────────────────────────────────
+
+Lumina 维护三套触发路径，写同一个文件（~/.lumina/digest.md），但用途不同：
+
+1. 全量日报（generate_digest）
+   ─ 触发：进程启动时 maybe_generate_digest()，或用户手动点"刷新"
+   ─ 采集：since_ts=None → 使用 config.history_hours（默认 24h）全量采集
+   ─ Prompt：DIGEST_SYSTEM_PROMPT（工作上下文助手，220-350 字）
+   ─ 写入：prepend 到 digest.md 头部，旧条目永久保留
+   ─ 副作用：更新 _last_generated_ts，供后续 changelog 用作增量起点
+
+2. 增量 Changelog（generate_changelog）
+   ─ 触发：定时器每隔 refresh_hours（默认 1h）调用 maybe_generate_changelog()
+   ─ 采集：since_ts=_last_generated_ts → 只采集上次生成后的新数据
+   ─ Prompt：CHANGELOG_SYSTEM_PROMPT（只写真正影响工作的变化，否则输出「无显著变化」）
+   ─ 写入：有实质变化才 prepend；LLM 判断无变化时直接 return None，不写文件
+   ─ 副作用：有写入时更新 _last_generated_ts
+
+3. 每日通知（daily notify，在 main.py 中触发）
+   ─ 触发：每天到 config.notify_time（默认 20:00）的那次定时器
+   ─ 行为：强制全量 generate_digest（force_full=True），忽略 history_hours 限制
+   ─ 额外：通过系统通知推送给用户
+
+关键状态变量：
+  _last_generated_ts  上次成功生成（全量或 changelog）的 Unix 时间戳
+                      ↳ collector cursor 的上界；进程重启后从 digest.md mtime 恢复
+  _generated_at       ISO 时间字符串，供 API /v1/digest 返回给前端展示
+  _generating         布尔，防止并发生成，前端可轮询此字段显示 loading 状态
+
+collector cursor 与 _last_generated_ts 的关系：
+  ┌──────────────┐  _collect_all(since_ts=_last_generated_ts)
+  │ _last_generated_ts ──────────────────────────────┐
+  │                                                   ↓
+  │  _CURSORS["_fallback"] = now - effective_hours    │ 各 collector 以此为下界
+  │  各 collector._CURSORS[name] = 上次该 collector 最新记录时间戳（更精细）
+  └──────────────────────────────────────────────────────────────────────────
+  collector cursor 比 _fallback 更精确，可独立滚动，互不影响。
+──────────────────────────────────────────────────────────────────────────────
 """
 import asyncio
 import logging
@@ -247,7 +288,7 @@ async def generate_changelog(llm) -> Optional[str]:
             system=CHANGELOG_SYSTEM_PROMPT,
             max_tokens=200, temperature=0.4,
         )
-        if "无显著变化" in changelog or not changelog.strip():
+        if changelog.strip() == "（无显著变化）" or not changelog.strip():
             logger.debug("Digest: changelog indicates no significant change")
             return None
 

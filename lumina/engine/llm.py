@@ -29,6 +29,11 @@ class LLMEngine:
         """
         请求显式传入 system_override 时直接使用，忽略配置。
         否则按 task 查配置，找不到返回 None（由 Provider 自行处理默认值）。
+
+        语义约定（调用方须知）：
+          system=None  → 使用配置文件里该 task 的 system prompt（或 "chat" 兜底）
+          system=""    → 显式传空字符串，会直接覆盖配置，省略 system 段
+          两者不等价；不想传 system 时应传 None，而非 ""。
         """
         if system_override is not None:
             return system_override

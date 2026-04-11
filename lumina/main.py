@@ -298,9 +298,10 @@ def cmd_server(args):
 
     threading.Thread(target=_startup_digest, daemon=True).start()
 
-    # LUMINA_DIGEST_INTERVAL 可在环境变量里覆盖（测试用），命令行参数优先
-    _env_interval = int(os.environ.get("LUMINA_DIGEST_INTERVAL", 3600))
-    digest_interval = getattr(args, "digest_interval", _env_interval)
+    # 优先级：CLI --digest-interval > LUMINA_DIGEST_INTERVAL 环境变量 > config.json refresh_hours
+    _env_interval = int(os.environ.get("LUMINA_DIGEST_INTERVAL", 0))
+    _cfg_interval = int(cfg.digest.get("refresh_hours", 1.0) * 3600)
+    digest_interval = getattr(args, "digest_interval", None) or _env_interval or _cfg_interval
     _start_digest_timer(llm, interval=digest_interval, uvicorn_loop=_uvicorn_loop)
     _start_daily_notify_timer(llm, uvicorn_loop=_uvicorn_loop)
 
@@ -843,8 +844,8 @@ def main():
     p_server.add_argument("--whisper-model", dest="whisper_model", default=None)
     p_server.add_argument("--log-level", dest="log_level", default=None,
                           choices=["DEBUG", "INFO", "WARNING", "ERROR"])
-    p_server.add_argument("--digest-interval", dest="digest_interval", type=int, default=3600,
-                          help="日报定时间隔（秒），默认 3600，测试时可改小如 30")
+    p_server.add_argument("--digest-interval", dest="digest_interval", type=int, default=None,
+                          help="日报定时间隔（秒），默认读取 config.json refresh_hours（1h），测试时可改小如 30")
     p_server.add_argument("--no-menubar", dest="menubar", action="store_false",
                           help="禁用 macOS 菜单栏图标")
     p_server.set_defaults(menubar=True)

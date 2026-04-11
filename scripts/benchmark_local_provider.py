@@ -163,7 +163,7 @@ async def _run_provider_once(
     return {
         "makespan": makespan,
         "avg_ttft": statistics.mean(ttfts),
-        "p95_ttft": max(ttfts),
+        "p95_ttft": sorted(ttfts)[int(len(ttfts) * 0.95)] if len(ttfts) >= 20 else max(ttfts),
         "chars_per_s": total_chars / makespan,
     }
 
@@ -229,7 +229,7 @@ def _print_provider_result(name: str, result: dict) -> None:
     print(f"{name}:")
     print(f"  makespan   : {result['makespan']:.3f}s")
     print(f"  avg TTFT   : {result['avg_ttft']:.3f}s")
-    print(f"  p95 TTFT   : {result['p95_ttft']:.3f}s")
+    print(f"  p95 TTFT   : {result['p95_ttft']:.3f}s  (p95 if n≥20, else max)")
     print(f"  throughput : {result['chars_per_s']:.2f} char/s")
 
 

@@ -66,21 +66,25 @@ class OpenAIProvider(BaseProvider):
         async with aiohttp.ClientSession(timeout=self.timeout) as session:
             async with session.post(url, headers=self._headers(), json=payload) as resp:
                 resp.raise_for_status()
-                async for raw_line in resp.content:
-                    line = raw_line.decode().strip()
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[len("data:"):].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                        delta = chunk["choices"][0]["delta"]
-                        content = delta.get("content")
-                        if content:
-                            yield content
-                    except (json.JSONDecodeError, KeyError, IndexError):
-                        continue
+                buf = ""
+                async for chunk in resp.content.iter_any():
+                    buf += chunk.decode(errors="replace")
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        line = line.strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[len("data:"):].strip()
+                        if data == "[DONE]":
+                            return
+                        try:
+                            obj = json.loads(data)
+                            delta = obj["choices"][0]["delta"]
+                            content = delta.get("content")
+                            if content:
+                                yield content
+                        except (json.JSONDecodeError, KeyError, IndexError):
+                            continue
 
     async def generate(
         self,

@@ -1,21 +1,44 @@
 """
 LocalProvider：使用本地 mlx-lm 模型进行推理（默认 Provider）。
 
-并发策略（Continuous Batching，仿 tLLM AsyncEngine）：
+──────────────────────────────────────────────────────────────────────────────
+架构分层（代码在类内按此顺序排列）
+──────────────────────────────────────────────────────────────────────────────
 
-  旧方案（Dynamic Batching）：
-    - 收集短窗口内的请求，串行跑完整个 stream_generate
-    - 请求 B 必须等请求 A 全部生成完才开始 → TTFT(B) = O(max_tokens_A × latency)
+Layer 0 — 生命周期（load / _init_batch_engine / _maybe_run_warmup）
+  模型加载、BatchGenerator 初始化、warmup。外部只调用 load()。
 
-  新方案（Continuous Batching）：
-    - prefill_queue：新请求入队
-    - _active：正在 decode 的 _RequestSlot，每个持有 KV cache + step_iter
-    - 调度循环每次迭代：
-        1. 从 prefill_queue 取新请求执行 prefill + 首 token，put 到 slot.token_queue
-        2. 对 _active 中已存在的请求各推进 1 步，put 到 slot.token_queue
-        3. 结束标志（None）put 到已完成请求的 queue
-    - 消费方从 token_queue.get() 流式消费，天然线程安全、无竞争
-    - 效果：TTFT(B) ≈ prefill(A) + 1 step，而非等 A 全部完成
+Layer 1 — Prompt 构建（_build_prompt_tokens / _render_prompt_text）
+  tokenizer 编码，chat_template 渲染。
+
+Layer 2 — System Prompt 缓存（_SystemPromptCacheEntry / _get_or_create_system_prompt_cache）
+  对高频 system prompt 做 KV-cache 预填充并缓存，避免每次重算。
+  LRU 上限 _SYSTEM_PROMPT_CACHE_SIZE（32 条）。
+
+Layer 3 — 请求槽（_RequestSlot）
+  每个推理请求的完整生命周期状态，token 通过 asyncio.Queue 流式交付给消费方。
+
+Layer 4a — 旧版调度器（_legacy_scheduler，即原 _scheduler）
+  单请求串行路径：prefill → decode 逐步推进，批量由 _run_one_iter 协调。
+  用于 LocalProvider 被子类覆盖 _do_prefill 时的 fallback 路径。
+
+Layer 4b — mlx-lm BatchGenerator 调度器（_mlx_batch_scheduler，即原 _batch_scheduler）
+  默认路径：将多请求提交给 mlx-lm 官方 BatchGenerator，每轮 .next() 批量推进。
+  支持专属 ThreadPoolExecutor（隔离 GPU 线程），通过 asyncio.Queue 与事件循环通信。
+
+  两套调度器互斥，由 _use_builtin_batch_engine() 决定走哪条路径：
+    type(self) is LocalProvider → True  → 走 _mlx_batch_scheduler
+    子类覆盖了 _do_prefill      → False → 走 _legacy_scheduler
+
+Layer 5 — 公共接口（generate_stream / generate）
+  协程 API，提交请求到 prefill_queue，从 token_queue 流式消费。
+
+──────────────────────────────────────────────────────────────────────────────
+Continuous Batching 工作原理（_legacy_scheduler 路径）
+──────────────────────────────────────────────────────────────────────────────
+  旧方案（Dynamic Batching）：请求 B 等 A 全部生成完 → TTFT(B) = O(max_tokens_A)
+  新方案：每次迭代 Phase1 prefill 新请求 + Phase2 推进已有请求，交错推进
+  效果：TTFT(B) ≈ prefill(A) + 1 decode step，而非等 A 全部完成
 """
 import asyncio
 import threading
@@ -111,7 +134,9 @@ class LocalProvider(BaseProvider):
         self._batch_executor: Optional[ThreadPoolExecutor] = None
         self._system_prompt_cache: OrderedDict[str, _SystemPromptCacheEntry] = OrderedDict()
 
-    # ── 生命周期 ──────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # Layer 0 — 生命周期
+    # ══════════════════════════════════════════════════════════════════════════
 
     def load(self):
         self._model, self._tokenizer = load(self.model_path)
@@ -148,10 +173,12 @@ class LocalProvider(BaseProvider):
             # 新 worker 启动前必须重建，否则下次调用时使用已关闭的对象导致卡死。
             if self._use_builtin_batch_engine():
                 self._init_batch_engine()
-            worker = self._batch_scheduler if self._use_builtin_batch_engine() else self._scheduler
+            worker = self._mlx_batch_scheduler if self._use_builtin_batch_engine() else self._legacy_scheduler
             self._worker_task = asyncio.create_task(worker())
 
-    # ── Prompt 构建 ───────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # Layer 1 — Prompt 构建
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _build_prompt_tokens(self, system: str, user_text: str) -> mx.array:
         prompt_str = self._render_prompt_text(system, user_text)
@@ -215,7 +242,9 @@ class LocalProvider(BaseProvider):
 
         mx.clear_cache()
 
-    # ── EOS token ids ─────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # Layer 2 — System Prompt 缓存（KV-cache 预填充，LRU 32 条）
+    # ══════════════════════════════════════════════════════════════════════════
 
     @property
     def _eos_ids(self) -> set:
@@ -224,7 +253,9 @@ class LocalProvider(BaseProvider):
             return set(eos)
         return {eos} if eos is not None else set()
 
-    # ── 同步推理（executor 线程）─────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # Layer 3 — 请求槽操作（token 投递、decode 推进）
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _put_token(self, slot: _RequestSlot, value) -> None:
         """线程安全地往 asyncio Queue put 值（在 executor 线程中调用）。"""
@@ -556,6 +587,10 @@ class LocalProvider(BaseProvider):
             slot.next_input_token = token_id
             self._emit_token_id(slot, token_id)
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # Layer 4a — 旧版调度器（_legacy_scheduler）：连续 batching，手动 KV cache 管理
+    # ══════════════════════════════════════════════════════════════════════════
+
     def _run_one_iter(self, prefill_list: List[_RequestSlot]) -> None:
         """
         单次调度迭代（executor 线程）：
@@ -581,8 +616,16 @@ class LocalProvider(BaseProvider):
         with self._active_lock:
             self._active = [s for s in self._active if not s.done]
 
-    async def _batch_scheduler(self) -> None:
-        """使用 mlx-lm BatchGenerator 作为默认 batch engine。"""
+    # ══════════════════════════════════════════════════════════════════════════
+    # Layer 4b — mlx-lm BatchGenerator 调度器（_mlx_batch_scheduler，默认路径）
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def _mlx_batch_scheduler(self) -> None:
+        """Layer 4b — mlx-lm BatchGenerator 调度器（默认路径）。
+
+        将请求批量提交给 mlx-lm BatchGenerator，每轮 .next() 推进一步，
+        通过 _batch_slots 映射 uid → slot，把 token/终止信号投入各自的 token_queue。
+        """
         try:
             while True:
                 if self._prefill_queue.empty() and not self._batch_slots and not self._batch_generator.unprocessed_prompts:
@@ -633,8 +676,7 @@ class LocalProvider(BaseProvider):
 
                     if response.finish_reason is not None:
                         slot.done = True
-                        if response.finish_reason == "stop":
-                            self._put_token_local(slot, None)
+                        self._put_token_local(slot, None)
                         self._batch_slots.pop(response.uid, None)
         finally:
             if self._batch_generator is not None:
@@ -655,9 +697,7 @@ class LocalProvider(BaseProvider):
             slot.done = True
             self._put_token_local(slot, None)
 
-    # ── 调度主循环 ────────────────────────────────────────────────────────────
-
-    async def _scheduler(self) -> None:
+    async def _legacy_scheduler(self) -> None:
         loop = asyncio.get_running_loop()
         while True:
             with self._active_lock:
@@ -676,7 +716,9 @@ class LocalProvider(BaseProvider):
 
             await loop.run_in_executor(None, self._run_one_iter, prefill_list)
 
-    # ── 公共接口 ──────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # Layer 5 — 公共接口
+    # ══════════════════════════════════════════════════════════════════════════
 
     async def generate_stream(
         self,
