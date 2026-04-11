@@ -220,7 +220,7 @@ def collect_browser_history(n: int = 50) -> str:
                 chrome_offset = 11644473600 * 1_000_000
                 cutoff_chrome = int(cutoff_unix * 1_000_000 + chrome_offset)
                 uri = chrome_db.as_uri() + "?mode=ro&immutable=1"
-                with sqlite3.connect(uri, uri=True) as conn:
+                with sqlite3.connect(uri, uri=True, timeout=3) as conn:
                     rows = conn.execute(
                         "SELECT title, url, last_visit_time FROM urls "
                         "WHERE last_visit_time > ? "
@@ -248,7 +248,7 @@ def collect_browser_history(n: int = 50) -> str:
                 try:
                     cutoff_ff = int(cutoff_unix * 1_000_000)
                     uri = places_db.as_uri() + "?mode=ro&immutable=1"
-                    with sqlite3.connect(uri, uri=True) as conn:
+                    with sqlite3.connect(uri, uri=True, timeout=3) as conn:
                         rows = conn.execute(
                             "SELECT title, url, last_visit_date FROM moz_places "
                             "WHERE last_visit_date > ? "
@@ -270,7 +270,7 @@ def collect_browser_history(n: int = 50) -> str:
                     safari_offset = 978307200  # CoreData epoch
                     cutoff_safari = cutoff_unix - safari_offset
                     uri = safari_db.as_uri() + "?mode=ro&immutable=1"
-                    with sqlite3.connect(uri, uri=True) as conn:
+                    with sqlite3.connect(uri, uri=True, timeout=3) as conn:
                         rows = conn.execute(
                             "SELECT hi.url, hv.title, hv.visit_time "
                             "FROM history_visits hv "
@@ -324,7 +324,7 @@ def collect_notes_app() -> str:
         cutoff_core = cutoff - 978307200
 
         uri = db_path.as_uri() + "?mode=ro&immutable=1"
-        with _sqlite3.connect(uri, uri=True) as conn:
+        with _sqlite3.connect(uri, uri=True, timeout=3) as conn:
             rows = conn.execute(
                 "SELECT ZTITLE1, ZSNIPPET, ZMODIFICATIONDATE1 FROM ZICCLOUDSYNCINGOBJECT "
                 "WHERE ZMODIFICATIONDATE1 > ? AND ZTITLE1 IS NOT NULL "
@@ -380,7 +380,7 @@ def collect_calendar() -> str:
         window_end = now_core + cfg.history_hours * 3600
 
         uri = _CALENDAR_DB.as_uri() + "?mode=ro&immutable=1"
-        with sqlite3.connect(uri, uri=True) as conn:
+        with sqlite3.connect(uri, uri=True, timeout=3) as conn:
             rows = conn.execute(
                 """
                 SELECT oc.occurrence_date, oc.occurrence_end_date,
@@ -662,7 +662,7 @@ def collect_ai_queries(n: int = 50) -> str:
                     pass
                 try:
                     shutil.copy2(str(cursor_db), str(tmp))
-                    with sqlite3.connect(str(tmp)) as conn:
+                    with sqlite3.connect(str(tmp), timeout=3) as conn:
                         rows = conn.execute(
                             "SELECT value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'"
                             " AND length(value) < 4000"

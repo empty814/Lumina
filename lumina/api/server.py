@@ -6,6 +6,7 @@ Lumina HTTP 服务
 import asyncio
 import json
 import logging
+import os
 import shutil
 import tempfile
 import time
@@ -111,15 +112,26 @@ def create_app(llm: LLMEngine, transcriber: Transcriber) -> FastAPI:
         """
         获取远程 PDF 的本地路径，优先命中缓存（~/.lumina/cache/pdf/）。
         返回缓存文件路径（永久文件，不应被临时目录清理）。
+        使用流式下载避免大文件全量加载进内存。
         """
-        from lumina.pdf_cache import get_cached, put_cache
+        from lumina.pdf_cache import get_cached, put_cache_file
         cached = get_cached(url)
         if cached:
             return cached
-        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-        return put_cache(url, resp.content)
+        tmp_fd, tmp_str = tempfile.mkstemp(suffix=".pdf", prefix="lumina_dl_")
+        tmp_path = Path(tmp_str)
+        try:
+            os.close(tmp_fd)
+            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+                async with client.stream("GET", url) as resp:
+                    resp.raise_for_status()
+                    with open(tmp_str, "wb") as f:
+                        async for chunk in resp.aiter_bytes(chunk_size=65536):
+                            f.write(chunk)
+            return put_cache_file(url, tmp_path)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
     async def _run_translate_job(job_id: str, pdf_path: str, lang_out: str):
         """后台翻译任务，结果写入 _pdf_jobs。完成后立即结束，清理由独立 task 负责。"""
@@ -166,7 +178,15 @@ def create_app(llm: LLMEngine, transcriber: Transcriber) -> FastAPI:
         def _extract_text() -> str:
             doc = fitz.open(pdf_path)
             try:
-                return "".join(p.get_text() for p in doc)[:8000]
+                chunks = []
+                total = 0
+                for p in doc:
+                    chunk = p.get_text()
+                    chunks.append(chunk)
+                    total += len(chunk)
+                    if total >= 8000:
+                        break
+                return "".join(chunks)[:8000]
             finally:
                 doc.close()
 

@@ -822,6 +822,16 @@ class LocalProvider(BaseProvider):
 
                     # 客户端取消时 generate_stream finally 会设置 slot.done=True
                     if slot.done:
+                        # 尝试通知底层 BatchGenerator 剔除废弃请求（兼容不同 mlx-lm 版本）
+                        _remove_fn = (
+                            getattr(self._batch_generator, "remove", None)
+                            or getattr(self._batch_generator, "cancel", None)
+                        )
+                        if _remove_fn is not None:
+                            try:
+                                _remove_fn([uid])
+                            except Exception:
+                                pass
                         self._batch_slots.pop(uid, None)
                         continue
 
@@ -931,9 +941,16 @@ class LocalProvider(BaseProvider):
 
     def _emit_token_id_local(self, slot: _RequestSlot, token_id: int) -> None:
         slot._token_ids.append(token_id)
-        new_text = self._tokenizer.decode(slot._token_ids)
-        delta = new_text[len(slot.decoded_text):]
-        slot.decoded_text = new_text
+        # 增量解码：≤512 token 或每 16 步全量校准一次，其余用单 token 快速估算。
+        # 避免长回答时 O(n²) decode 阻塞事件循环主线程。
+        n = len(slot._token_ids)
+        if n <= 512 or n % 16 == 0:
+            new_text = self._tokenizer.decode(slot._token_ids)
+            delta = new_text[len(slot.decoded_text):]
+            slot.decoded_text = new_text
+        else:
+            delta = self._tokenizer.decode([token_id])
+            slot.decoded_text += delta
         slot.n_tokens += 1
         self._put_token_local(slot, delta)
 

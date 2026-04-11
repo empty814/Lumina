@@ -7,6 +7,7 @@ Key：sha256(url)[:16] + 原始文件名后缀，如 a3f2b1c0_2602.23881.pdf
 """
 import hashlib
 import logging
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -47,5 +48,21 @@ def put_cache(url: str, data: bytes) -> Path:
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
+    logger.info("Cached PDF: %s", dest)
+    return dest
+
+
+def put_cache_file(url: str, src_path: Path) -> Path:
+    """
+    将已流式写入的临时文件原子移动到缓存，返回缓存文件路径。
+    优先 rename（同文件系统）；跨文件系统时 fallback 到 copy2 + unlink。
+    """
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    dest = _cache_path(url)
+    try:
+        src_path.rename(dest)
+    except OSError:
+        shutil.copy2(str(src_path), str(dest))
+        src_path.unlink(missing_ok=True)
     logger.info("Cached PDF: %s", dest)
     return dest
