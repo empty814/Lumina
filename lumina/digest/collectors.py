@@ -116,6 +116,9 @@ def collect_shell_history(n: int = 100) -> str:
                 if line.startswith(": ") and ";" in line:
                     line = line.split(";", 1)[1]
                 line = line.strip()
+                # 跳过 bash HISTTIMEFORMAT 产生的 "#<unix_ts>" 行
+                if line.startswith("#") and line[1:].isdigit():
+                    continue
                 if not line or line in seen:
                     continue
                 seen.add(line)
@@ -215,9 +218,11 @@ def collect_browser_history(n: int = 50) -> str:
         if _sys.platform == "win32":
             chrome_db = (Path.home() / "AppData" / "Local" /
                          "Google" / "Chrome" / "User Data" / "Default" / "History")
-        else:
+        elif _sys.platform == "darwin":
             chrome_db = (Path.home() / "Library" / "Application Support" /
                          "Google" / "Chrome" / "Default" / "History")
+        else:  # Linux
+            chrome_db = Path.home() / ".config" / "google-chrome" / "Default" / "History"
         if chrome_db.exists():
             try:
                 chrome_offset = 11644473600 * 1_000_000
@@ -239,8 +244,10 @@ def collect_browser_history(n: int = 50) -> str:
         # ── Firefox ───────────────────────────────────────────────────────────
         if _sys.platform == "win32":
             ff_profiles = Path.home() / "AppData" / "Roaming" / "Mozilla" / "Firefox" / "Profiles"
-        else:
+        elif _sys.platform == "darwin":
             ff_profiles = Path.home() / "Library" / "Application Support" / "Firefox" / "Profiles"
+        else:  # Linux
+            ff_profiles = Path.home() / ".mozilla" / "firefox"
         if ff_profiles.exists():
             for profile_dir in ff_profiles.iterdir():
                 places_db = profile_dir / "places.sqlite"
@@ -482,7 +489,8 @@ def collect_markdown_notes() -> str:
         succeeded: set = set()
         for mtime, md, current_hash in candidates[:10]:
             try:
-                content = md.read_text(errors="replace")[:200].strip()
+                with md.open(errors="replace") as _f:
+                    content = _f.read(200).strip()
                 if content:
                     entries.append(f"**{md.name}**:\n  {content}")
                     succeeded.add(md)

@@ -5,6 +5,7 @@ Lumina HTTP 服务
 """
 import asyncio
 import json
+import logging
 import shutil
 import tempfile
 import time
@@ -39,6 +40,8 @@ from lumina.api.protocol import (
     UsageInfo,
     random_uuid,
 )
+
+logger = logging.getLogger("lumina")
 
 # PDF 翻译 job 存储：job_id -> {"status": str, "mono": path, "dual": path, "dir": tmpdir, "ts": float}
 _pdf_jobs: dict[str, dict] = {}
@@ -168,9 +171,20 @@ def create_app(llm: LLMEngine, transcriber: Transcriber) -> FastAPI:
                 doc.close()
 
         text = await asyncio.to_thread(_extract_text)
-        async for token in llm.generate_stream(text, task="summarize"):
-            yield f"data: {json.dumps({'text': token})}\n\n"
+        try:
+            async for token in llm.generate_stream(text, task="summarize"):
+                yield f"data: {json.dumps({'text': token})}\n\n"
+        except Exception as e:
+            logger.error("stream_summary error: %s", e)
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
         yield "data: [DONE]\n\n"
+
+    async def _write_upload(upload_file: UploadFile, dest: str) -> None:
+        """流式写入上传文件，避免全量加载进内存。"""
+        def _sync_copy():
+            with open(dest, "wb") as f:
+                shutil.copyfileobj(upload_file.file, f)
+        await asyncio.to_thread(_sync_copy)
 
     @app.post("/v1/pdf/upload")
     async def pdf_upload(
@@ -182,7 +196,7 @@ def create_app(llm: LLMEngine, transcriber: Transcriber) -> FastAPI:
             raise HTTPException(400, "仅支持 PDF 文件")
         tmp_dir = tempfile.mkdtemp(prefix="lumina_")
         pdf_path = str(Path(tmp_dir) / Path(file.filename).name)
-        Path(pdf_path).write_bytes(await file.read())
+        await _write_upload(file, pdf_path)
 
         job_id = uuid.uuid4().hex
         _pdf_jobs[job_id] = {"status": "running", "dir": tmp_dir, "ts": time.time()}
@@ -239,7 +253,7 @@ def create_app(llm: LLMEngine, transcriber: Transcriber) -> FastAPI:
             raise HTTPException(400, "仅支持 PDF 文件")
         tmp_dir = tempfile.mkdtemp(prefix="lumina_")
         pdf_path = str(Path(tmp_dir) / Path(file.filename).name)
-        Path(pdf_path).write_bytes(await file.read())
+        await _write_upload(file, pdf_path)
         return StreamingResponse(
             _extract_and_stream_summary(pdf_path),
             media_type="text/event-stream",
@@ -330,33 +344,38 @@ def create_app(llm: LLMEngine, transcriber: Transcriber) -> FastAPI:
 
     async def _stream_chat(request: ChatCompletionRequest, raw_req: Request, user_text: str, system_override: Optional[str] = None):
         req_id = f"chatcmpl-{random_uuid()}"
-        async for token in llm.generate_stream(
-            user_text,
-            task="chat",
-            max_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            system=system_override,
-        ):
-            chunk = ChatCompletionStreamResponse(
-                id=req_id,
-                model=request.model,
-                choices=[
-                    ChatCompletionStreamChoice(
-                        delta=ChatCompletionStreamDelta(content=token)
-                    )
-                ],
-            )
-            yield f"data: {chunk.model_dump_json()}\n\n"
-            if await raw_request_disconnected(raw_req):
-                break
+        finish_reason = "stop"
+        try:
+            async for token in llm.generate_stream(
+                user_text,
+                task="chat",
+                max_tokens=request.max_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                system=system_override,
+            ):
+                chunk = ChatCompletionStreamResponse(
+                    id=req_id,
+                    model=request.model,
+                    choices=[
+                        ChatCompletionStreamChoice(
+                            delta=ChatCompletionStreamDelta(content=token)
+                        )
+                    ],
+                )
+                yield f"data: {chunk.model_dump_json()}\n\n"
+                if await raw_request_disconnected(raw_req):
+                    break
+        except Exception as e:
+            logger.error("stream_chat error: %s", e)
+            finish_reason = "error"
         end_chunk = ChatCompletionStreamResponse(
             id=req_id,
             model=request.model,
             choices=[
                 ChatCompletionStreamChoice(
                     delta=ChatCompletionStreamDelta(),
-                    finish_reason="stop",
+                    finish_reason=finish_reason,
                 )
             ],
         )
@@ -402,8 +421,12 @@ def create_app(llm: LLMEngine, transcriber: Transcriber) -> FastAPI:
         return TextResponse(text=text)
 
     async def _stream_text(user_text: str, task: str):
-        async for token in llm.generate_stream(user_text, task=task):
-            yield f"data: {json.dumps({'text': token})}\n\n"
+        try:
+            async for token in llm.generate_stream(user_text, task=task):
+                yield f"data: {json.dumps({'text': token})}\n\n"
+        except Exception as e:
+            logger.error("stream_text error: %s", e)
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
         yield "data: [DONE]\n\n"
 
     # ── 语音转写：上传文件（OpenAI 兼容）─────────────────────────────────────
@@ -412,7 +435,12 @@ def create_app(llm: LLMEngine, transcriber: Transcriber) -> FastAPI:
     async def transcriptions(
         file: UploadFile = File(...),
         language: Optional[str] = Form(None),
+        raw: Request = None,
     ):
+        if raw is not None:
+            content_length = raw.headers.get("content-length")
+            if content_length and int(content_length) > 100 * 1024 * 1024:
+                raise HTTPException(413, "文件过大，最大支持 100MB")
         wav_bytes = await file.read()
         text = await transcriber.transcribe(wav_bytes, language=language)
         return TranscriptionResponse(text=text)
@@ -484,7 +512,7 @@ def _cleanup_after(tmp_dir: str, delay: int = 30):
 
     async def _do():
         await asyncio.sleep(delay)
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        await asyncio.to_thread(shutil.rmtree, tmp_dir, True)
 
     return BackgroundTask(_do)
 
@@ -494,7 +522,7 @@ async def _delayed_rmtree(path: str, delay: int = 300):
     try:
         await asyncio.sleep(delay)
     finally:
-        shutil.rmtree(path, ignore_errors=True)
+        await asyncio.to_thread(shutil.rmtree, path, True)
 
 
 async def raw_request_disconnected(request) -> bool:

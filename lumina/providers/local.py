@@ -141,6 +141,7 @@ class LocalProvider(BaseProvider):
         self._batch_generator: Optional[BatchGenerator] = None
         self._batch_slots: dict[int, _RequestSlot] = {}
         self._batch_executor: Optional[ThreadPoolExecutor] = None
+        self._legacy_executor: Optional[ThreadPoolExecutor] = None
         self._system_prompt_cache: OrderedDict[str, _SystemPromptCacheEntry] = OrderedDict()
         self._supports_enable_thinking: Optional[bool] = None
 
@@ -248,7 +249,14 @@ class LocalProvider(BaseProvider):
             # 新 worker 启动前必须重建，否则下次调用时使用已关闭的对象导致卡死。
             if self._use_builtin_batch_engine():
                 self._init_batch_engine()
-            worker = self._mlx_batch_scheduler if self._use_builtin_batch_engine() else self._legacy_scheduler
+            if self._use_builtin_batch_engine():
+                worker = self._mlx_batch_scheduler
+            else:
+                if self._legacy_executor is None:
+                    self._legacy_executor = ThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix="lumina_legacy"
+                    )
+                worker = self._legacy_scheduler
             self._worker_task = asyncio.create_task(worker())
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -950,7 +958,7 @@ class LocalProvider(BaseProvider):
                     except asyncio.QueueEmpty:
                         break
 
-                await loop.run_in_executor(None, self._run_one_iter, prefill_list)
+                await loop.run_in_executor(self._legacy_executor, self._run_one_iter, prefill_list)
         except Exception as e:
             logger.error("legacy_scheduler crashed: %s", e, exc_info=True)
             with self._active_lock:
@@ -959,6 +967,8 @@ class LocalProvider(BaseProvider):
                 if not slot.done:
                     slot.done = True
                     self._put_token_local(slot, RuntimeError(f"Scheduler crashed: {e}"))
+            with self._active_lock:
+                self._active.clear()
             # 排空 prefill_queue，避免已入队但未被取走的请求永久悬挂
             while True:
                 try:
