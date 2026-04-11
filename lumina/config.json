@@ -17,7 +17,7 @@
   "log_level": "INFO",
   "digest": {
     "_readme": "enabled=false 可完全关闭 digest（不再定时采集/生成）；scan_dirs 为空时使用默认目录（~/Documents, ~/Desktop 等）；enabled_collectors 为 null 时全部启用，填列表可按需禁用某个来源，可选值：collect_shell_history / collect_git_logs / collect_clipboard / collect_browser_history / collect_calendar / collect_notes_app / collect_markdown_notes / collect_ai_queries",
-    "enabled": true,
+    "enabled": false,
     "scan_dirs": [],
     "history_hours": 24,
     "refresh_hours": 1,

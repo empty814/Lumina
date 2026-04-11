@@ -37,7 +37,7 @@ class DigestConfig:
     refresh_hours: float = 1.0    # 每隔多久检查一次增量
     notify_time: str = "20:00"    # 每日通知时间，格式 "HH:MM"，空字符串表示禁用
     enabled_collectors: Optional[List[str]] = None  # None = 全部启用
-    enabled: bool = True  # False = 完全关闭 digest（不自动也不手动生成）
+    enabled: bool = False  # False = 完全关闭 digest（不自动也不手动生成）
 
 
 _cfg: DigestConfig = DigestConfig()
