@@ -430,6 +430,8 @@ def test_find_cached_repo_snapshot_prefers_latest(monkeypatch, tmp_path):
 
 
 def test_system_prompt_cache_reuses_prefix_cache(monkeypatch):
+    from lumina.providers import system_prompt_cache as spc_mod
+
     class FakeCacheLayer:
         def __init__(self, state):
             self._state = state
@@ -449,14 +451,16 @@ def test_system_prompt_cache_reuses_prefix_cache(monkeypatch):
     provider = LocalProvider(model_path="synthetic")
     provider._model = object()
     provider._tokenizer = object()
+    from lumina.providers.system_prompt_cache import SystemPromptCache
+    provider._spc = SystemPromptCache(provider._model, provider._tokenizer)
 
     prefill_calls = []
 
     monkeypatch.setattr(provider, "_derive_system_prefix_tokens", lambda system_text: [1, 2, 3])
-    monkeypatch.setattr(local_mod.mlx_cache, "make_prompt_cache", lambda model: [FakeCacheLayer((mx.array([1, 2, 3]),))])
+    monkeypatch.setattr(spc_mod.mlx_cache, "make_prompt_cache", lambda model: [FakeCacheLayer((mx.array([1, 2, 3]),))])
     monkeypatch.setattr(
-        provider,
-        "_prefill_full_prompt_cache",
+        provider._spc,
+        "_prefill",
         lambda prompt_tokens, prompt_cache: prefill_calls.append(list(prompt_tokens)),
     )
 
@@ -484,10 +488,12 @@ def test_prepare_batch_generator_prompt_falls_back_when_prefix_mismatches():
         def from_state(cls, state, meta_state):
             return cls(state)
 
+    from lumina.providers.system_prompt_cache import SystemPromptCache
     provider = LocalProvider(model_path="synthetic")
     provider._model = object()
     provider._tokenizer = object()
-    provider._system_prompt_cache["sys"] = local_mod._SystemPromptCacheEntry(
+    provider._spc = SystemPromptCache(provider._model, provider._tokenizer)
+    provider._spc._cache["sys"] = local_mod._SystemPromptCacheEntry(
         system_text="sys",
         prefix_tokens=[9, 9],
         prompt_cache=[FakeCacheLayer((mx.array([1]),))],
@@ -524,10 +530,12 @@ def test_prepare_batch_generator_prompt_reconstructs_full_prompt_when_cache_hits
         def from_state(cls, state, meta_state):
             return cls(state)
 
+    from lumina.providers.system_prompt_cache import SystemPromptCache
     provider = LocalProvider(model_path="synthetic")
     provider._model = object()
     provider._tokenizer = object()
-    provider._system_prompt_cache["sys"] = local_mod._SystemPromptCacheEntry(
+    provider._spc = SystemPromptCache(provider._model, provider._tokenizer)
+    provider._spc._cache["sys"] = local_mod._SystemPromptCacheEntry(
         system_text="sys",
         prefix_tokens=[1, 2],
         prompt_cache=[FakeCacheLayer((mx.array([7, 8]),))],
@@ -544,68 +552,82 @@ def test_prepare_batch_generator_prompt_reconstructs_full_prompt_when_cache_hits
     suffix_tokens, prompt_cache = provider._prepare_batch_generator_prompt(slot)
 
     assert prompt_cache is not None
-    assert provider._system_prompt_cache["sys"].prefix_tokens + suffix_tokens == [1, 2, 3, 4, 5]
+    assert provider._spc._cache["sys"].prefix_tokens + suffix_tokens == [1, 2, 3, 4, 5]
+
+
+def _make_scheduler():
+    """构造最小化 MlxBatchScheduler，不依赖真实 model/tokenizer。"""
+    from lumina.providers.scheduler import MlxBatchScheduler
+    return MlxBatchScheduler(
+        model=object(),
+        tokenizer=object(),
+        batch_generator=None,
+        batch_executor=None,
+        loop=asyncio.new_event_loop(),
+        prepare_prompt_fn=lambda slot: ([], None),
+        emit_token_fn=lambda slot, tok: None,
+    )
 
 
 def test_iter_batch_responses_flattens_nested_containers():
-    provider = LocalProvider(model_path="synthetic")
+    scheduler = _make_scheduler()
     r1 = {"uid": 1, "token": 10, "finish_reason": None}
     r2 = {"uid": 2, "token": 11, "finish_reason": None}
     r3 = {"uid": 3, "token": 12, "finish_reason": "stop"}
     nested = [[r1, [r2]], (r3,)]
 
-    flattened = list(provider._iter_batch_responses(nested))
+    flattened = list(scheduler._iter_batch_responses(nested))
 
     assert flattened == [r1, r2, r3]
 
 
 def test_response_field_helpers_support_dict_payloads():
-    provider = LocalProvider(model_path="synthetic")
+    scheduler = _make_scheduler()
     resp = {"uid": 7, "token": "42", "finish_reason": "stop"}
 
-    assert provider._response_uid(resp) == 7
-    assert provider._response_token(resp) == 42
-    assert provider._response_finish_reason(resp) == "stop"
+    assert scheduler._response_uid(resp) == 7
+    assert scheduler._response_token(resp) == 42
+    assert scheduler._response_finish_reason(resp) == "stop"
 
 
 def test_batch_generator_pending_probe_is_compatible_with_missing_field():
-    provider = LocalProvider(model_path="synthetic")
+    scheduler = _make_scheduler()
 
     class FakeBatchGenerator:
         pass
 
-    provider._batch_generator = FakeBatchGenerator()
+    scheduler._batch_generator = FakeBatchGenerator()
 
-    assert provider._batch_generator_has_unprocessed_prompts() is False
+    assert scheduler._batch_generator_has_unprocessed_prompts() is False
 
 
 def test_batch_generator_pending_probe_reads_unprocessed_prompts_field():
-    provider = LocalProvider(model_path="synthetic")
+    scheduler = _make_scheduler()
 
     class FakeBatchGenerator:
         def __init__(self):
             self.unprocessed_prompts = [1]
 
-    provider._batch_generator = FakeBatchGenerator()
+    scheduler._batch_generator = FakeBatchGenerator()
 
-    assert provider._batch_generator_has_unprocessed_prompts() is True
+    assert scheduler._batch_generator_has_unprocessed_prompts() is True
 
 
 def test_extract_generation_responses_prefers_generation_part_for_tuple():
-    provider = LocalProvider(model_path="synthetic")
+    scheduler = _make_scheduler()
     prompt_responses = [{"uid": 1, "token": None, "finish_reason": None}]
     generation_responses = [{"uid": 2, "token": 7, "finish_reason": None}]
 
-    extracted = provider._extract_generation_responses((prompt_responses, generation_responses))
+    extracted = scheduler._extract_generation_responses((prompt_responses, generation_responses))
 
     assert extracted == generation_responses
 
 
 def test_extract_generation_responses_keeps_non_tuple_payload():
-    provider = LocalProvider(model_path="synthetic")
+    scheduler = _make_scheduler()
     payload = [{"uid": 2, "token": 7, "finish_reason": None}]
 
-    extracted = provider._extract_generation_responses(payload)
+    extracted = scheduler._extract_generation_responses(payload)
 
     assert extracted == payload
 
@@ -696,3 +718,64 @@ def test_finish_reason_stop_also_emits_none_terminator():
     sentinel = slot.token_queue.get_nowait()
     assert sentinel is None
     assert slot.done is True
+
+
+# ── SystemPromptCache LRU 淘汰 ────────────────────────────────────────────────
+
+def test_system_prompt_cache_evicts_lru():
+    """LRU 满 32 条后，最旧的条目被淘汰。"""
+    from lumina.providers.system_prompt_cache import SystemPromptCache, SystemPromptCacheEntry
+
+    class FakeCacheLayer:
+        @property
+        def state(self):
+            return mx.array([0])
+
+        @property
+        def meta_state(self):
+            return ()
+
+        @classmethod
+        def from_state(cls, state, meta_state):
+            return cls()
+
+    spc = SystemPromptCache(model=object(), tokenizer=object())
+    # 直接插入 33 条，绕过 _prefill
+    for i in range(33):
+        key = f"sys_{i}"
+        entry = SystemPromptCacheEntry(
+            system_text=key,
+            prefix_tokens=[i],
+            prompt_cache=[FakeCacheLayer()],
+        )
+        spc._cache[key] = entry
+        spc._cache.move_to_end(key)
+        while len(spc._cache) > spc.MAX_SIZE:
+            spc._cache.popitem(last=False)
+
+    assert len(spc._cache) == 32
+    assert "sys_0" not in spc._cache  # 最旧条目被淘汰
+    assert "sys_32" in spc._cache     # 最新条目保留
+
+
+# ── MlxBatchScheduler 响应解析 ────────────────────────────────────────────────
+
+def test_mlx_batch_scheduler_response_helpers_with_object_attrs():
+    """response helpers 应能解析有属性的对象。"""
+
+    class FakeResponse:
+        uid = 99
+        token = 42
+        finish_reason = "stop"
+
+    scheduler = _make_scheduler()
+    resp = FakeResponse()
+    assert scheduler._response_uid(resp) == 99
+    assert scheduler._response_token(resp) == 42
+    assert scheduler._response_finish_reason(resp) == "stop"
+
+
+def test_mlx_batch_scheduler_iter_handles_none():
+    """_iter_batch_responses(None) 应该安全地不 yield 任何值。"""
+    scheduler = _make_scheduler()
+    assert list(scheduler._iter_batch_responses(None)) == []

@@ -1,198 +1,24 @@
 """
-lumina/digest/collectors.py — 各数据源采集函数
+lumina/digest/collectors/apps.py — 应用程序数据源采集
 
-每个函数独立、失败静默返回空字符串。
-新增数据源：在此文件追加函数，并在 core.py 的 _COLLECTORS 列表中注册。
-
-──────────────────────────────────────────────────────────────────
-当前已支持的数据来源
-──────────────────────────────────────────────────────────────────
-【终端历史】collect_shell_history
-  └─ ~/.zsh_history 或 ~/.bash_history
-     解析 zsh 扩展格式（`: ts:0;cmd`），按 cutoff 过滤，自动去重
-     兜底：文件无时间戳（bash history）→ 取最近 n=100 条
-
-【Git 提交】collect_git_logs
-  └─ 扫描 scan_dirs 下深度 ≤3 的所有 .git 目录
-     --since= 使用 cutoff 时间戳
-
-【剪贴板】collect_clipboard
-  └─ macOS pbpaste，截断至 500 字符，无状态
-
-【浏览器历史】collect_browser_history
-  ├─ Google Chrome  ~/Library/Application Support/Google/Chrome/Default/History
-  ├─ Firefox        ~/Library/Application Support/Firefox/Profiles/*/places.sqlite
-  └─ Safari         ~/Library/Safari/History.db
-
-【备忘录（Notes.app）】collect_notes_app
-  └─ 直接读取 NoteStore.sqlite
-     cutoff 转换为 CoreData epoch（cutoff - 978307200）
-
-【日历事项】collect_calendar
-  └─ ~/Library/Group Containers/group.com.apple.calendar/Calendar.sqlitedb
-     读取 OccurrenceCache + CalendarItem，采集今天及未来 cfg.history_hours 内的事件
-
-【本地 Markdown 笔记】collect_markdown_notes
-  └─ 扫描 scan_dirs 目录
-     mtime > cutoff + md5 去重（过滤 Cursor/iCloud 等 mtime-only 误触发）
-
-【AI 对话提问】collect_ai_queries
-  ├─ Claude Code  ~/.claude/history.jsonl + projects/**/*.jsonl
-  ├─ OpenAI Codex CLI  ~/.codex/history.jsonl
-  └─ Cursor  state.vscdb（无可靠时间戳，用 db mtime 作为代理）
-──────────────────────────────────────────────────────────────────
+包含：浏览器历史、备忘录（Notes.app）、日历（Calendar.app）、AI 对话（Claude/Codex/Cursor）。
 """
 import json
 import logging
 import os
 import shutil
 import sqlite3
-import subprocess
 import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 from lumina.digest.config import get_cfg
-from lumina.digest.cursor_store import load_md_hashes, md5_of_file, save_md_hashes
 
 logger = logging.getLogger("lumina.digest")
 
-# 上次 collect_markdown_notes 扫到的文件列表，供 debug 面板展示
-_last_md_files: list[dict] = []
-
-
-# ── Collectors ────────────────────────────────────────────────────────────────
-
-def collect_shell_history(n: int = 100) -> str:
-    cfg = get_cfg()
-    cutoff = time.time() - cfg.history_hours * 3600
-    try:
-        zsh  = Path.home() / ".zsh_history"
-        bash = Path.home() / ".bash_history"
-        src  = zsh if zsh.exists() else (bash if bash.exists() else None)
-        if not src:
-            return ""
-        raw = src.read_text(errors="replace").splitlines()
-
-        cmds: list[str] = []
-        seen: set[str] = set()
-        has_timestamps = False
-
-        for line in reversed(raw):
-            ts_val: Optional[float] = None
-            cmd = line
-
-            # 解析 zsh 扩展格式：": <unix_ts>:<elapsed>;<command>"
-            if line.startswith(": ") and ";" in line:
-                try:
-                    meta, cmd = line.split(";", 1)
-                    # meta = ": 1712500000:0"  →  parts[1] 是时间戳
-                    ts_str = meta.split(":")[1].strip()
-                    ts_val = float(ts_str)
-                    has_timestamps = True
-                except (ValueError, IndexError):
-                    pass
-
-            if ts_val is not None:
-                # 倒序迭代：遇到早于 cutoff 的记录即可停止
-                if ts_val <= cutoff:
-                    break
-
-            cmd = cmd.strip()
-            if not cmd or cmd in seen:
-                continue
-            seen.add(cmd)
-            cmds.append(cmd)
-            if len(cmds) >= n:
-                break
-
-        # 兜底：整个文件无可解析时间戳（bash history 或纯文本格式）
-        # → 回退到原来的取最近 n 条逻辑
-        if not has_timestamps:
-            cmds, seen = [], set()
-            for line in reversed(raw):
-                if line.startswith(": ") and ";" in line:
-                    line = line.split(";", 1)[1]
-                line = line.strip()
-                # 跳过 bash HISTTIMEFORMAT 产生的 "#<unix_ts>" 行
-                if line.startswith("#") and line[1:].isdigit():
-                    continue
-                if not line or line in seen:
-                    continue
-                seen.add(line)
-                cmds.append(line)
-                if len(cmds) >= n:
-                    break
-
-        if not cmds:
-            return ""
-        return "## 终端历史（最近命令）\n" + "\n".join(f"  {c}" for c in reversed(cmds))
-    except Exception as e:
-        logger.debug("shell history: %s", e)
-        return ""
-
-
-def collect_git_logs(n: int = 20) -> str:
-    cfg = get_cfg()
-    cutoff = time.time() - cfg.history_hours * 3600
-    since = datetime.fromtimestamp(cutoff).strftime("%Y-%m-%d %H:%M")
-    try:
-        entries, seen_repos = [], set()
-
-        for root_str in cfg.scan_dirs:
-            root = Path(root_str).expanduser()
-            if not root.exists():
-                continue
-            for git_dir in _walk_git_dirs(root, max_depth=4):
-                repo_dir = git_dir.parent
-                if repo_dir in seen_repos:
-                    continue
-                seen_repos.add(repo_dir)
-                try:
-                    # "%ct %H %s"：commit Unix 时间戳 + hash + subject
-                    result = subprocess.run(
-                        ["git", "log", "--format=%ct %H %s",
-                         f"--since={since}", f"-{n}"],
-                        cwd=str(repo_dir), capture_output=True, text=True, timeout=5
-                    )
-                    lines = result.stdout.strip().splitlines()
-                    if lines:
-                        display_lines = []
-                        for raw_line in lines:
-                            parts = raw_line.split(" ", 2)
-                            if len(parts) == 3:
-                                _, hash_part, subject = parts
-                                display_lines.append(f"  {hash_part[:7]} {subject}")
-                            else:
-                                display_lines.append(f"  {raw_line}")
-                        entries.append(f"**{repo_dir.name}**:\n" +
-                                       "\n".join(display_lines))
-                except Exception:
-                    continue
-
-        if not entries:
-            return ""
-        return "## Git 提交（过去 %.0fh）\n" % cfg.history_hours + "\n\n".join(entries)
-    except Exception as e:
-        logger.debug("git logs: %s", e)
-        return ""
-
-
-def collect_clipboard() -> str:
-    # 无状态，不使用 cutoff
-    try:
-        from lumina.platform_utils import clipboard_get
-        content = clipboard_get().strip()
-        if not content:
-            return ""
-        if len(content) > 500:
-            content = content[:500] + "…（已截断）"
-        return f"## 剪贴板内容\n{content}"
-    except Exception as e:
-        logger.debug("clipboard: %s", e)
-        return ""
+_CALENDAR_DB = Path.home() / "Library/Group Containers/group.com.apple.calendar/Calendar.sqlitedb"
+_CALENDAR_CORE_OFFSET = 978307200  # CoreData epoch = Unix epoch - 978307200
 
 
 def collect_browser_history(n: int = 50) -> str:
@@ -352,10 +178,6 @@ def collect_notes_app() -> str:
         return ""
 
 
-_CALENDAR_DB = Path.home() / "Library/Group Containers/group.com.apple.calendar/Calendar.sqlitedb"
-_CALENDAR_CORE_OFFSET = 978307200  # CoreData epoch = Unix epoch - 978307200
-
-
 def collect_calendar() -> str:
     """读取 macOS Calendar，返回今天及未来 history_hours 内的日程（仅 macOS）。
 
@@ -424,120 +246,6 @@ def collect_calendar() -> str:
         return ""
     except Exception as e:
         logger.debug("calendar sqlite: %s", e)
-        return ""
-
-
-_MD_SKIP_PARTS = {".app", "build", "dist", "node_modules", ".git", ".venv", "__pycache__"}
-
-_GIT_SKIP_DIRS = {".git", ".venv", "node_modules", "build", "dist", "__pycache__", ".app"}
-
-
-def _walk_git_dirs(root: Path, max_depth: int = 4):
-    """yield 深度 ≤ max_depth 的 .git 目录父路径（即仓库根），不进入忽略目录。"""
-    def _recurse(path: Path, depth: int):
-        if depth > max_depth:
-            return
-        try:
-            with os.scandir(path) as it:
-                entries = list(it)
-        except (PermissionError, OSError):
-            return
-        for entry in entries:
-            if entry.name == ".git" and entry.is_dir(follow_symlinks=False):
-                yield Path(entry.path)
-            elif entry.is_dir(follow_symlinks=False) and entry.name not in _GIT_SKIP_DIRS:
-                yield from _recurse(Path(entry.path), depth + 1)
-    yield from _recurse(root, 0)
-
-
-def _walk_md_files(root: Path, max_depth: int = 4):
-    """yield 深度 ≤ max_depth 的 .md 文件，不进入忽略目录及隐藏目录。"""
-    root_str = str(root)
-    root_depth = root_str.count(os.sep)
-    for dirpath, dirnames, filenames in os.walk(root_str):
-        cur_depth = dirpath.count(os.sep) - root_depth
-        if cur_depth >= max_depth:
-            dirnames.clear()
-        else:
-            dirnames[:] = [
-                d for d in dirnames
-                if d not in _MD_SKIP_PARTS and not d.startswith(".")
-            ]
-        for fname in filenames:
-            if fname.endswith(".md"):
-                yield Path(dirpath) / fname
-
-
-def collect_markdown_notes() -> str:
-    """扫描 scan_dirs 下最近修改的 .md 文件。
-
-    两级过滤：
-    1. mtime > cutoff（快速跳过明显旧文件）
-    2. md5(前4KB) 与上次采集不同（过滤 Cursor/iCloud 等 mtime-only 误触发）
-    """
-    cfg = get_cfg()
-    cutoff = time.time() - cfg.history_hours * 3600
-    try:
-        hashes = load_md_hashes()
-        candidates: list[tuple[float, Path]] = []
-
-        for root_str in cfg.scan_dirs:
-            root = Path(root_str).expanduser()
-            if not root.exists():
-                continue
-            for md in _walk_md_files(root, max_depth=4):
-                try:
-                    mtime = md.stat().st_mtime
-                    if mtime <= cutoff:
-                        continue
-                    # mtime 有变化，再用 md5 确认内容是否真的改了
-                    key = str(md)
-                    current_hash = md5_of_file(md)
-                    if hashes.get(key) == current_hash:
-                        # 内容未变（编辑器扫描/同步等误触发），更新 hash 记录但不采集
-                        hashes[key] = current_hash
-                        continue
-                    candidates.append((mtime, md, current_hash))
-                except Exception:
-                    continue
-
-        global _last_md_files
-        _last_md_files = [
-            {"path": str(md), "mtime": mtime}
-            for mtime, md, _ in sorted(candidates, key=lambda x: -x[0])
-        ]
-
-        if not candidates:
-            return ""
-
-        candidates.sort(key=lambda x: -x[0])
-
-        entries = []
-        succeeded: set = set()
-        for mtime, md, current_hash in candidates[:10]:
-            try:
-                with md.open(errors="replace") as _f:
-                    content = _f.read(200).strip()
-                if content:
-                    entries.append(f"**{md.name}**:\n  {content}")
-                    succeeded.add(md)
-            except Exception:
-                logger.debug("markdown notes: failed to read %s", md)
-                continue
-
-        # 只更新成功读出内容的文件 hash，读取失败或超出前 10 名的文件保留旧 hash，
-        # 确保下次运行仍可重新采集
-        if entries:
-            for mtime, md, current_hash in candidates[:10]:
-                if md in succeeded:
-                    hashes[str(md)] = current_hash
-            save_md_hashes(hashes)
-
-        if not entries:
-            return ""
-        return "## 本地 Markdown 笔记\n" + "\n\n".join(entries)
-    except Exception as e:
-        logger.debug("markdown notes: %s", e)
         return ""
 
 

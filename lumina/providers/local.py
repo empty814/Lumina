@@ -11,9 +11,9 @@ Layer 0 — 生命周期（load / _init_batch_engine / _maybe_run_warmup）
 Layer 1 — Prompt 构建（_build_prompt_tokens / _render_prompt_text）
   tokenizer 编码，chat_template 渲染。
 
-Layer 2 — System Prompt 缓存（_SystemPromptCacheEntry / _get_or_create_system_prompt_cache）
-  对高频 system prompt 做 KV-cache 预填充并缓存，避免每次重算。
-  LRU 上限 _SYSTEM_PROMPT_CACHE_SIZE（32 条）。
+Layer 2 — System Prompt 缓存（_get_or_create_system_prompt_cache）
+  委托给 SystemPromptCache（providers/system_prompt_cache.py）。
+  对高频 system prompt 做 KV-cache 预填充并缓存（LRU 32 条）。
 
 Layer 3 — 请求槽（_RequestSlot）
   每个推理请求的完整生命周期状态，token 通过 asyncio.Queue 流式交付给消费方。
@@ -23,6 +23,7 @@ Layer 4a — 旧版调度器（_legacy_scheduler，即原 _scheduler）
   用于 LocalProvider 被子类覆盖 _do_prefill 时的 fallback 路径。
 
 Layer 4b — mlx-lm BatchGenerator 调度器（_mlx_batch_scheduler，即原 _batch_scheduler）
+  委托给 MlxBatchScheduler（providers/scheduler.py）。
   默认路径：将多请求提交给 mlx-lm 官方 BatchGenerator，每轮 .next() 批量推进。
   支持专属 ThreadPoolExecutor（隔离 GPU 线程），通过 asyncio.Queue 与事件循环通信。
 
@@ -45,7 +46,6 @@ import inspect
 import logging
 import os
 import threading
-from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -62,6 +62,7 @@ except ImportError:
     _MLX_AVAILABLE = False
 
 from .base import BaseProvider
+from .system_prompt_cache import SystemPromptCache, SystemPromptCacheEntry
 
 # 每次迭代最多接入的新 prefill 请求数。
 # 取 4 可以更快吸收一小波同时到达的短请求，降低后到请求的排队 TTFT。
@@ -77,11 +78,8 @@ _DEFAULT_MODEL_DIRNAME = "qwen3.5-0.8b-4bit"
 logger = logging.getLogger("lumina")
 
 
-@dataclass
-class _SystemPromptCacheEntry:
-    system_text: str
-    prefix_tokens: List[int]
-    prompt_cache: List[Any]
+# Backward-compat alias for tests that import _SystemPromptCacheEntry from local
+_SystemPromptCacheEntry = SystemPromptCacheEntry
 
 
 @dataclass
@@ -136,13 +134,12 @@ class LocalProvider(BaseProvider):
         self._active: List[_RequestSlot] = []
         self._active_lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._continuous_batch_ids: Optional[tuple[str, ...]] = None
+        self._continuous_batch_ids: Optional[tuple] = None
         self._continuous_batch_cache: Optional[List[Any]] = None
         self._batch_generator: Optional[BatchGenerator] = None
-        self._batch_slots: dict[int, _RequestSlot] = {}
         self._batch_executor: Optional[ThreadPoolExecutor] = None
         self._legacy_executor: Optional[ThreadPoolExecutor] = None
-        self._system_prompt_cache: OrderedDict[str, _SystemPromptCacheEntry] = OrderedDict()
+        self._spc: Optional[SystemPromptCache] = None
         self._supports_enable_thinking: Optional[bool] = None
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -217,6 +214,7 @@ class LocalProvider(BaseProvider):
         load_target = self._resolve_load_target()
         self._model, self._tokenizer = load(load_target)
         mx.eval(self._model.parameters())
+        self._spc = SystemPromptCache(self._model, self._tokenizer)
         self._init_batch_engine()
         self._maybe_run_warmup()
 
@@ -242,7 +240,6 @@ class LocalProvider(BaseProvider):
         if self._prefill_queue is None or self._loop is not current_loop:
             self._prefill_queue = asyncio.Queue()
             self._not_empty = asyncio.Event()
-            self._batch_slots = {}
         if self._worker_task is None or self._worker_task.done():
             self._loop = current_loop
             # _batch_scheduler finally 会 close batch_generator / shutdown executor；
@@ -290,7 +287,7 @@ class LocalProvider(BaseProvider):
     def _should_run_warmup(self) -> bool:
         return self.enable_warmup
 
-    def _warmup_prompt(self) -> tuple[str, str]:
+    def _warmup_prompt(self) -> tuple:
         return _WARMUP_SYSTEM_PROMPT, _WARMUP_USER_PROMPT
 
     def _maybe_run_warmup(self) -> None:
@@ -337,7 +334,7 @@ class LocalProvider(BaseProvider):
         mx.clear_cache()
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Layer 2 — System Prompt 缓存（KV-cache 预填充，LRU 32 条）
+    # Layer 2 — System Prompt 缓存（委托给 SystemPromptCache）
     # ══════════════════════════════════════════════════════════════════════════
 
     @property
@@ -347,50 +344,8 @@ class LocalProvider(BaseProvider):
             return set(eos)
         return {eos} if eos is not None else set()
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Layer 3 — 请求槽操作（token 投递、decode 推进）
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _put_token(self, slot: _RequestSlot, value) -> None:
-        """线程安全地往 asyncio Queue put 值（在 executor 线程中调用）。"""
-        self._loop.call_soon_threadsafe(slot.token_queue.put_nowait, value)
-
-    def _put_token_local(self, slot: _RequestSlot, value) -> None:
-        """在 event loop 线程内直接投递 token。"""
-        slot.token_queue.put_nowait(value)
-
-    def _use_dedicated_batch_executor(self) -> bool:
-        return True
-
-    def _use_builtin_batch_engine(self) -> bool:
-        return type(self) is LocalProvider
-
-    def _sample_from_logits(self, logits: mx.array, slot: _RequestSlot) -> int:
-        logprobs = logits - mx.logsumexp(logits, keepdims=True)
-        return int(slot.sampler(logprobs).item())
-
-    def _clone_prompt_cache(self, prompt_cache: List[Any]) -> List[Any]:
-        return [
-            type(cache_layer).from_state(
-                cache_layer.state,
-                cache_layer.meta_state,
-            )
-            for cache_layer in prompt_cache
-        ]
-
-    def _prefill_full_prompt_cache(self, prompt_tokens: List[int], prompt_cache: List[Any]) -> None:
-        prompt = mx.array(prompt_tokens)
-        while len(prompt) > 0:
-            n_to_process = min(2048, len(prompt))
-            self._model(prompt[:n_to_process][None], cache=prompt_cache)
-            mx.eval([c.state for c in prompt_cache])
-            prompt = prompt[n_to_process:]
-            mx.clear_cache()
-        for cache_layer in prompt_cache:
-            if hasattr(cache_layer, "finalize"):
-                cache_layer.finalize()
-
     def _derive_system_prefix_tokens(self, system_text: str) -> Optional[List[int]]:
+        """将 system_text 渲染为 prefix token ids（供 SystemPromptCache.render_fn 使用）。"""
         prompt_text = self._render_prompt_text(system_text, _SYSTEM_PROMPT_SENTINEL)
         sentinel_start = prompt_text.find(_SYSTEM_PROMPT_SENTINEL)
         if sentinel_start < 0 or prompt_text.find(_SYSTEM_PROMPT_SENTINEL, sentinel_start + 1) != -1:
@@ -424,50 +379,26 @@ class LocalProvider(BaseProvider):
 
         return input_ids[: sentinel_token_indices[0]]
 
-    def _get_or_create_system_prompt_cache(self, system_text: str) -> Optional[_SystemPromptCacheEntry]:
-        cached = self._system_prompt_cache.get(system_text)
-        if cached is not None:
-            self._system_prompt_cache.move_to_end(system_text)
-            logger.debug(
-                "system_prompt_cache HIT  key_len=%d prefix_tokens=%d cache_size=%d",
-                len(system_text), len(cached.prefix_tokens), len(self._system_prompt_cache),
-            )
-            return cached
-
-        prefix_tokens = self._derive_system_prefix_tokens(system_text)
-        if not prefix_tokens:
-            logger.debug(
-                "system_prompt_cache SKIP  key_len=%d (prefix derivation failed)",
-                len(system_text),
-            )
+    def _get_or_create_system_prompt_cache(self, system_text: str) -> Optional[SystemPromptCacheEntry]:
+        """委托给 SystemPromptCache，注入 render_fn（避免反向依赖）。"""
+        if self._spc is None:
             return None
-
-        logger.debug(
-            "system_prompt_cache MISS  key_len=%d → building prefix cache (%d tokens)",
-            len(system_text), len(prefix_tokens),
-        )
-        prompt_cache = mlx_cache.make_prompt_cache(self._model)
-        self._prefill_full_prompt_cache(prefix_tokens, prompt_cache)
-        entry = _SystemPromptCacheEntry(
-            system_text=system_text,
-            prefix_tokens=prefix_tokens,
-            prompt_cache=self._clone_prompt_cache(prompt_cache),
-        )
-        self._system_prompt_cache[system_text] = entry
-        self._system_prompt_cache.move_to_end(system_text)
-        while len(self._system_prompt_cache) > _SYSTEM_PROMPT_CACHE_SIZE:
-            evicted = next(iter(self._system_prompt_cache))
-            self._system_prompt_cache.popitem(last=False)
-            logger.debug("system_prompt_cache EVICT  key_len=%d (LRU)", len(evicted))
-        return entry
-
-    def _prepare_batch_generator_prompt(self, slot: _RequestSlot) -> tuple[List[int], Optional[List[Any]]]:
-        prompt_tokens = [int(tok) for tok in slot.prompt_tokens]
         try:
-            cache_entry = self._get_or_create_system_prompt_cache(slot.system_text)
+            return self._spc.get_or_create(
+                system_text,
+                render_fn=self._derive_system_prefix_tokens,
+            )
         except Exception as e:
             logger.debug("system_prompt_cache error during lookup: %s", e)
-            return prompt_tokens, None
+            return None
+
+    def _clone_prompt_cache(self, prompt_cache: List[Any]) -> List[Any]:
+        """委托给 SystemPromptCache.clone_cache_raw。"""
+        return SystemPromptCache.clone_cache_raw(prompt_cache)
+
+    def _prepare_batch_generator_prompt(self, slot: _RequestSlot) -> tuple:
+        prompt_tokens = [int(tok) for tok in slot.prompt_tokens]
+        cache_entry = self._get_or_create_system_prompt_cache(slot.system_text)
         if cache_entry is None:
             return prompt_tokens, None
 
@@ -495,6 +426,40 @@ class LocalProvider(BaseProvider):
         )
         return suffix_tokens, self._clone_prompt_cache(cache_entry.prompt_cache)
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # Layer 3 — 请求槽操作（token 投递、decode 推进）
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _put_token(self, slot: _RequestSlot, value) -> None:
+        """线程安全地往 asyncio Queue put 值（在 executor 线程中调用）。"""
+        self._loop.call_soon_threadsafe(slot.token_queue.put_nowait, value)
+
+    def _put_token_local(self, slot: _RequestSlot, value) -> None:
+        """在 event loop 线程内直接投递 token。"""
+        slot.token_queue.put_nowait(value)
+
+    def _use_dedicated_batch_executor(self) -> bool:
+        return True
+
+    def _use_builtin_batch_engine(self) -> bool:
+        return type(self) is LocalProvider
+
+    def _sample_from_logits(self, logits: mx.array, slot: _RequestSlot) -> int:
+        logprobs = logits - mx.logsumexp(logits, keepdims=True)
+        return int(slot.sampler(logprobs).item())
+
+    def _prefill_full_prompt_cache(self, prompt_tokens: List[int], prompt_cache: List[Any]) -> None:
+        prompt = mx.array(prompt_tokens)
+        while len(prompt) > 0:
+            n_to_process = min(2048, len(prompt))
+            self._model(prompt[:n_to_process][None], cache=prompt_cache)
+            mx.eval([c.state for c in prompt_cache])
+            prompt = prompt[n_to_process:]
+            mx.clear_cache()
+        for cache_layer in prompt_cache:
+            if hasattr(cache_layer, "finalize"):
+                cache_layer.finalize()
+
     def _emit_token_id(self, slot: _RequestSlot, token_id: int) -> None:
         slot._token_ids.append(token_id)
         # 增量解码：decode 整个序列仍是最安全的方式（BPE tokenizer 对上下文敏感），
@@ -517,11 +482,30 @@ class LocalProvider(BaseProvider):
             slot.done = True
             self._put_token(slot, None)
 
+    def _emit_token_id_local(self, slot: _RequestSlot, token_id: int) -> None:
+        slot._token_ids.append(token_id)
+        # 增量解码：≤512 token 或每 16 步全量校准一次，其余用单 token 快速估算。
+        # 避免长回答时 O(n²) decode 阻塞事件循环主线程。
+        n = len(slot._token_ids)
+        if n <= 512 or n % 16 == 0:
+            new_text = self._tokenizer.decode(slot._token_ids)
+            delta = new_text[len(slot.decoded_text):]
+            slot.decoded_text = new_text
+        else:
+            delta = self._tokenizer.decode([token_id])
+            slot.decoded_text += delta
+        slot.n_tokens += 1
+        self._put_token_local(slot, delta)
+
+        if slot.n_tokens >= slot.max_tokens:
+            slot.done = True
+            self._put_token_local(slot, None)
+
     def _reset_continuous_batch(self) -> None:
         self._continuous_batch_ids = None
         self._continuous_batch_cache = None
 
-    def _materialize_continuous_batch(self, slot_by_id: dict[str, _RequestSlot]) -> None:
+    def _materialize_continuous_batch(self, slot_by_id: dict) -> None:
         if self._continuous_batch_cache is None or self._continuous_batch_ids is None:
             return
         for idx, request_id in enumerate(self._continuous_batch_ids):
@@ -749,214 +733,22 @@ class LocalProvider(BaseProvider):
             self._active = [s for s in self._active if not s.done]
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Layer 4b — mlx-lm BatchGenerator 调度器（_mlx_batch_scheduler，默认路径）
+    # Layer 4b — mlx-lm BatchGenerator 调度器（委托给 MlxBatchScheduler）
     # ══════════════════════════════════════════════════════════════════════════
 
     async def _mlx_batch_scheduler(self) -> None:
-        """Layer 4b — mlx-lm BatchGenerator 调度器（默认路径）。
-
-        将请求批量提交给 mlx-lm BatchGenerator，每轮 .next() 推进一步，
-        通过 _batch_slots 映射 uid → slot，把 token/终止信号投入各自的 token_queue。
-        """
-        try:
-            while True:
-                if (
-                    self._prefill_queue.empty()
-                    and not self._batch_slots
-                    and not self._batch_generator_has_unprocessed_prompts()
-                ):
-                    self._not_empty.clear()
-                    # clear() 后重新检查，防止 put+set 与 clear+wait 交错时丢唤醒
-                    if (
-                        self._prefill_queue.empty()
-                        and not self._batch_slots
-                        and not self._batch_generator_has_unprocessed_prompts()
-                    ):
-                        await self._not_empty.wait()
-
-                new_slots: List[_RequestSlot] = []
-                while True:
-                    try:
-                        new_slots.append(self._prefill_queue.get_nowait())
-                    except asyncio.QueueEmpty:
-                        break
-
-                if new_slots:
-                    prompts = []
-                    caches = []
-                    samplers = [make_sampler(temp=slot.temperature, top_p=slot.top_p) for slot in new_slots]
-                    max_tokens = [slot.max_tokens for slot in new_slots]
-                    for slot in new_slots:
-                        prompt_tokens, prompt_cache = self._prepare_batch_generator_prompt(slot)
-                        prompts.append(prompt_tokens)
-                        caches.append(prompt_cache)
-                    uids = self._batch_generator.insert(
-                        prompts,
-                        max_tokens=max_tokens,
-                        samplers=samplers,
-                        caches=caches,
-                    )
-                    for slot, uid, sampler in zip(new_slots, uids, samplers):
-                        slot.batch_uid = uid
-                        slot.sampler = sampler
-                        self._batch_slots[uid] = slot
-
-                if (
-                    not self._batch_slots
-                    and not self._batch_generator_has_unprocessed_prompts()
-                ):
-                    continue
-
-                if self._batch_executor is not None:
-                    responses = await asyncio.get_running_loop().run_in_executor(self._batch_executor, self._batch_generator.next)
-                else:
-                    responses = await asyncio.get_running_loop().run_in_executor(None, self._batch_generator.next)
-                generation_responses = self._extract_generation_responses(responses)
-                for response in self._iter_batch_responses(generation_responses):
-                    uid = self._response_uid(response)
-                    if uid is None:
-                        continue
-                    slot = self._batch_slots.get(uid)
-                    if slot is None:
-                        continue
-
-                    # 客户端取消时 generate_stream finally 会设置 slot.done=True
-                    if slot.done:
-                        # 尝试通知底层 BatchGenerator 剔除废弃请求（兼容不同 mlx-lm 版本）
-                        _remove_fn = (
-                            getattr(self._batch_generator, "remove", None)
-                            or getattr(self._batch_generator, "cancel", None)
-                        )
-                        if _remove_fn is not None:
-                            try:
-                                _remove_fn([uid])
-                            except Exception:
-                                pass
-                        self._batch_slots.pop(uid, None)
-                        continue
-
-                    finish_reason = self._response_finish_reason(response)
-                    token = self._response_token(response)
-                    if finish_reason != "stop" and token is not None:
-                        self._emit_token_id_local(slot, token)
-
-                    if finish_reason is not None:
-                        slot.done = True
-                        self._put_token_local(slot, None)
-                        self._batch_slots.pop(uid, None)
-        except Exception as e:
-            logger.error("mlx_batch_scheduler crashed: %s", e, exc_info=True)
-            for slot in list(self._batch_slots.values()):
-                if not slot.done:
-                    slot.done = True
-                    self._put_token_local(slot, RuntimeError(f"Scheduler crashed: {e}"))
-            self._batch_slots.clear()
-            # 排空 prefill_queue，避免已入队但未被取走的请求永久悬挂
-            while True:
-                try:
-                    slot = self._prefill_queue.get_nowait()
-                    if not slot.done:
-                        slot.done = True
-                        self._put_token_local(slot, RuntimeError(f"Scheduler crashed: {e}"))
-                except asyncio.QueueEmpty:
-                    break
-        finally:
-            if self._batch_generator is not None:
-                self._batch_generator.close()
-            if self._batch_executor is not None:
-                self._batch_executor.shutdown(wait=False, cancel_futures=False)
-                self._batch_executor = None
-
-    def _extract_generation_responses(self, responses: Any) -> Any:
-        """
-        兼容 mlx-lm 0.31.x: next() 返回 (prompt_responses, generation_responses)。
-        仅处理 generation_responses，避免在高并发下无效遍历 prompt 进度响应。
-        """
-        if isinstance(responses, tuple) and len(responses) == 2:
-            return responses[1]
-        return responses
-
-    def _iter_batch_responses(self, responses: Any):
-        """兼容 mlx-lm 不同版本 next() 返回结构（list / 嵌套 list / tuple）。"""
-        if responses is None:
-            return
-        stack = [responses]
-        while stack:
-            item = stack.pop()
-            if isinstance(item, (list, tuple)):
-                stack.extend(reversed(item))
-                continue
-            yield item
-
-    def _batch_generator_has_unprocessed_prompts(self) -> bool:
-        """兼容不同 mlx-lm 版本的 pending prompts 字段。"""
-        if self._batch_generator is None:
-            return False
-
-        bg = self._batch_generator
-        for attr in (
-            "unprocessed_prompts",
-            "_unprocessed_prompts",
-            "pending_prompts",
-            "_pending_prompts",
-        ):
-            if not hasattr(bg, attr):
-                continue
-            value = getattr(bg, attr)
-            try:
-                return len(value) > 0
-            except Exception:
-                return bool(value)
-
-        count = getattr(bg, "num_unprocessed_prompts", 0)
-        try:
-            return int(count) > 0
-        except Exception:
-            return bool(count)
-
-    def _response_uid(self, response: Any) -> Optional[int]:
-        if hasattr(response, "uid"):
-            return getattr(response, "uid")
-        if isinstance(response, dict):
-            return response.get("uid")
-        return None
-
-    def _response_finish_reason(self, response: Any):
-        if hasattr(response, "finish_reason"):
-            return getattr(response, "finish_reason")
-        if isinstance(response, dict):
-            return response.get("finish_reason")
-        return None
-
-    def _response_token(self, response: Any) -> Optional[int]:
-        if hasattr(response, "token"):
-            token = getattr(response, "token")
-        elif isinstance(response, dict):
-            token = response.get("token")
-        else:
-            return None
-        if token is None:
-            return None
-        return int(token)
-
-    def _emit_token_id_local(self, slot: _RequestSlot, token_id: int) -> None:
-        slot._token_ids.append(token_id)
-        # 增量解码：≤512 token 或每 16 步全量校准一次，其余用单 token 快速估算。
-        # 避免长回答时 O(n²) decode 阻塞事件循环主线程。
-        n = len(slot._token_ids)
-        if n <= 512 or n % 16 == 0:
-            new_text = self._tokenizer.decode(slot._token_ids)
-            delta = new_text[len(slot.decoded_text):]
-            slot.decoded_text = new_text
-        else:
-            delta = self._tokenizer.decode([token_id])
-            slot.decoded_text += delta
-        slot.n_tokens += 1
-        self._put_token_local(slot, delta)
-
-        if slot.n_tokens >= slot.max_tokens:
-            slot.done = True
-            self._put_token_local(slot, None)
+        """Layer 4b — 委托给 MlxBatchScheduler（providers/scheduler.py）。"""
+        from .scheduler import MlxBatchScheduler
+        scheduler = MlxBatchScheduler(
+            model=self._model,
+            tokenizer=self._tokenizer,
+            batch_generator=self._batch_generator,
+            batch_executor=self._batch_executor,
+            loop=self._loop,
+            prepare_prompt_fn=self._prepare_batch_generator_prompt,
+            emit_token_fn=self._emit_token_id_local,
+        )
+        await scheduler.run(self._prefill_queue, self._not_empty)
 
     async def _legacy_scheduler(self) -> None:
         loop = asyncio.get_running_loop()

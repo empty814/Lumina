@@ -136,3 +136,11 @@ def reset_config() -> None:
     """重置全局配置单例，下次 get_config() 调用时重新加载。测试用。"""
     global _instance
     _instance = None
+
+
+# ── Lumina 数据目录路径常量 ────────────────────────────────────────────────
+# 所有 ~/.lumina/ 子路径集中在此定义，避免各模块重复构造。
+LUMINA_HOME = Path.home() / ".lumina"
+DIGEST_PATH = LUMINA_HOME / "digest.md"
+DIGEST_CONTEXT_LOG_DIR = LUMINA_HOME / "digest_context_log"
+PDF_CACHE_DIR = LUMINA_HOME / "cache" / "pdf"

@@ -11,9 +11,12 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
+
+from lumina.config import PDF_CACHE_DIR
+
 logger = logging.getLogger("lumina.pdf_cache")
 
-CACHE_DIR = Path.home() / ".lumina" / "cache" / "pdf"
+CACHE_DIR = PDF_CACHE_DIR
 
 
 def _cache_path(url: str) -> Path:

@@ -250,10 +250,17 @@ def test_get_status_recovers_generated_at_from_existing_digest(tmp_path):
     mtime = time.time() - 123
     os.utime(digest_path, (mtime, mtime))
 
-    with patch.object(core, "_DIGEST_PATH", digest_path), \
-         patch.object(core, "_generated_at", None), \
-         patch.object(core, "_last_generated_ts", None):
-        status = core.get_status()
+    # 重置 _state，使 sync_from_digest_file 能从文件恢复 generated_at
+    saved_generated_at = core._state.generated_at
+    saved_last_ts = core._state.last_generated_ts
+    core._state.generated_at = None
+    core._state.last_generated_ts = None
+    try:
+        with patch.object(core, "_DIGEST_PATH", digest_path):
+            status = core.get_status()
+    finally:
+        core._state.generated_at = saved_generated_at
+        core._state.last_generated_ts = saved_last_ts
 
     assert status["generating"] is False
     assert status["generated_at"] == datetime.fromtimestamp(mtime).isoformat()
@@ -278,21 +285,114 @@ async def test_maybe_generate_digest_skips_when_lock_held(tmp_path):
         await asyncio.sleep(0.05)
 
     with patch.object(core, "_DIGEST_PATH", digest_path), \
-         patch.object(core, "_generated_at", None), \
-         patch.object(core, "_last_generated_ts", None), \
          patch.object(core, "generate_digest", _slow_generate), \
          patch.object(core, "_collect_all", AsyncMock(return_value="mocked context")):
         # 注入共享 lock，使两次并发调用看到同一个实例
-        core._digest_lock = shared_lock
+        saved_lock = core._state._digest_lock
+        core._state._digest_lock = shared_lock
         try:
             await asyncio.gather(
                 core.maybe_generate_digest(object(), force_full=True),
                 core.maybe_generate_digest(object(), force_full=True),
             )
         finally:
-            core._digest_lock = None
+            core._state._digest_lock = saved_lock
 
     assert generate_calls == 1, f"Expected 1 generate call, got {generate_calls}"
+
+
+# ── DigestState ────────────────────────────────────────────────────────────────
+
+def test_digest_state_thread_safety():
+    """多线程并发 set_generating 不应 raise。"""
+    import threading
+    from lumina.digest.core import DigestState
+
+    state = DigestState()
+    errors = []
+
+    def _toggle():
+        try:
+            for _ in range(200):
+                state.set_generating(True)
+                state.set_generating(False)
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=_toggle) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+
+
+def test_digest_state_set_generated_updates_timestamps():
+    from lumina.digest.core import DigestState
+    state = DigestState()
+    ts = 1_700_000_000.0
+    state.set_generated(ts)
+    assert state.last_generated_ts == ts
+    assert state.generated_at == datetime.fromtimestamp(ts).isoformat()
+
+
+def test_digest_state_to_status_returns_snapshot():
+    from lumina.digest.core import DigestState
+    state = DigestState()
+    state.set_generating(True)
+    status = state.to_status()
+    assert status["generating"] is True
+    assert "generated_at" in status
+
+
+# ── CollectorRunner ────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_collector_runner_timeout_returns_exception():
+    """超时 collector 返回 Exception，不阻塞其他 collector。"""
+    from lumina.digest.core import CollectorRunner
+
+    runner = CollectorRunner()
+
+    def _slow():
+        import time
+        time.sleep(60)  # 远超 TIMEOUT
+
+    def _fast():
+        return "fast_result"
+
+    # 临时把 TIMEOUT 改成 0.05s
+    orig_timeout = runner.TIMEOUT
+    runner.TIMEOUT = 0.05
+    try:
+        results = await runner.run_all([_slow, _fast], effective_hours=24.0)
+    finally:
+        runner.TIMEOUT = orig_timeout
+
+    assert isinstance(results["_slow"], Exception)
+    assert results["_fast"] == "fast_result"
+
+
+@pytest.mark.asyncio
+async def test_collector_runner_enabled_filter():
+    """_collect_all 通过 enabled_collectors 过滤时，CollectorRunner 只运行选中的 collector。"""
+    from lumina.digest.core import CollectorRunner
+
+    runner = CollectorRunner()
+    called = []
+
+    def collector_a():
+        called.append("a")
+        return "result_a"
+
+    def collector_b():
+        called.append("b")
+        return "result_b"
+
+    results = await runner.run_all([collector_a], effective_hours=1.0)
+    assert "collector_a" in results
+    assert "collector_b" not in results
+    assert called == ["a"]
 
 
 @pytest.mark.asyncio
