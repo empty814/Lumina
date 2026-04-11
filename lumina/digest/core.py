@@ -44,7 +44,9 @@ collector cursor 与 _last_generated_ts 的关系：
 """
 import asyncio
 import logging
+import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -67,20 +69,29 @@ from lumina.digest.collectors import (
 logger = logging.getLogger("lumina.digest")
 
 _DIGEST_PATH   = Path.home() / ".lumina" / "digest.md"
-_LOCK_PATH     = Path.home() / ".lumina" / "digest.lock"
+_CONTEXT_LOG_DIR = Path.home() / ".lumina" / "digest_context_log"
 
-# 模块级状态，供 API 查询
+# 模块级状态，供 API 查询；asyncio 协程与 threading.Timer 线程共享，需加锁保护
+_state_lock = threading.Lock()
+# asyncio.Lock：真正防止同一 event loop 内两个协程并发生成 digest
+# 注意：必须在 event loop 内使用（maybe_generate_* 均为 async），不跨进程
+_digest_lock: Optional[asyncio.Lock] = None
 _generating: bool = False
 _generated_at: Optional[str] = None
-
+_last_generated_ts: Optional[float] = None
 # 上次 collector 结果缓存（key=函数名, value={chars, lines, preview, error}）
 _last_collector_results: dict = {}
 
-# 上次成功生成日报的时间戳（秒），用于计算增量采集窗口
-_last_generated_ts: Optional[float] = None
-
-# 当前进程启动时间，用于识别上一个进程遗留的 lock 文件
+# 当前进程启动时间，用于识别旧状态
 _PROCESS_STARTED_TS = time.time()
+
+
+def _get_digest_lock() -> asyncio.Lock:
+    """懒初始化 asyncio.Lock，确保在 event loop 内创建。"""
+    global _digest_lock
+    if _digest_lock is None:
+        _digest_lock = asyncio.Lock()
+    return _digest_lock
 
 # 注册的采集器列表——新增数据源在此追加
 _COLLECTORS = [
@@ -163,7 +174,8 @@ async def _collect_all(since_ts: Optional[float] = None) -> str:
 
     # ── 注入 per-collector cursor ─────────────────────────────────────────────
     cursors = load_cursors()
-    cursors["_fallback"] = time.time() - effective_hours * 3600
+    fallback_ts = time.time() - effective_hours * 3600
+    cursors["_fallback"] = fallback_ts
     _collectors_mod._CURSORS = cursors          # 线程启动前写入，collector 只读
 
     active = _COLLECTORS
@@ -171,23 +183,39 @@ async def _collect_all(since_ts: Optional[float] = None) -> str:
         enabled_set = set(cfg.enabled_collectors)
         active = [fn for fn in _COLLECTORS if fn.__name__ in enabled_set]
 
+    logger.info(
+        "Digest collect start: effective_hours=%.2f fallback_since=%s active_collectors=%s",
+        effective_hours,
+        datetime.fromtimestamp(fallback_ts).strftime("%Y-%m-%d %H:%M:%S"),
+        [fn.__name__ for fn in active],
+    )
+
     # 每个 collector 独立超时 30s，超时直接视为异常，不 block 其他 collector
     _COLLECTOR_TIMEOUT = 30
 
+    loop = asyncio.get_running_loop()
+    # shutdown(wait=False)：超时取消等待后不阻塞等待慢线程，避免单个 collector 卡住整个采集。
+    # 超时线程仍在后台运行直到自然结束，但不影响本次 digest 生成。
+    executor = ThreadPoolExecutor(max_workers=max(len(active), 1))
+
     async def _run_with_timeout(fn):
+        t0 = time.time()
         try:
-            return await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 loop.run_in_executor(executor, fn),
                 timeout=_COLLECTOR_TIMEOUT,
             )
+            logger.debug("Digest: collector %s done in %.2fs", fn.__name__, time.time() - t0)
+            return result
         except asyncio.TimeoutError:
             logger.warning("Digest: collector %s timed out after %ds", fn.__name__, _COLLECTOR_TIMEOUT)
             return Exception(f"timeout after {_COLLECTOR_TIMEOUT}s")
 
-    loop = asyncio.get_running_loop()
-    with override_history_hours(effective_hours):
-        with ThreadPoolExecutor(max_workers=max(len(active), 1)) as executor:
+    try:
+        with override_history_hours(effective_hours):
             results = await asyncio.gather(*[_run_with_timeout(fn) for fn in active])
+    finally:
+        executor.shutdown(wait=False)
 
     # ── 保存 collector 写回的 cursor（去掉内部哨兵 key）─────────────────────
     updated = {k: v for k, v in _collectors_mod._CURSORS.items()
@@ -203,6 +231,7 @@ async def _collect_all(since_ts: Optional[float] = None) -> str:
             # 此处没有活跃异常上下文，traceback.format_exc() 只会得到空栈。
             cache[name] = {"chars": 0, "lines": 0, "preview": None,
                            "error": str(r)}
+            logger.warning("Digest: collector %s error: %s", name, str(r))
         else:
             text = r or ""
             if text == "__PERMISSION_DENIED__":
@@ -211,6 +240,7 @@ async def _collect_all(since_ts: Optional[float] = None) -> str:
                     "permission_denied": True,
                     "error": None,
                 }
+                logger.warning("Digest: collector %s permission denied", name)
             else:
                 cache[name] = {
                     "chars": len(text),
@@ -221,7 +251,14 @@ async def _collect_all(since_ts: Optional[float] = None) -> str:
                 }
                 if text.strip():
                     sections.append(text)
-    _last_collector_results = cache
+                logger.debug("Digest: collector %s → %d chars", name, len(text))
+    with _state_lock:
+        _last_collector_results = cache
+
+    logger.info(
+        "Digest collect done: %d/%d collectors produced content, total_chars=%d",
+        len(sections), len(active), sum(len(s) for s in sections),
+    )
 
     if not sections:
         return "（未采集到任何本地活动记录）"
@@ -232,7 +269,11 @@ async def _collect_all(since_ts: Optional[float] = None) -> str:
 # ── 摘要生成 ──────────────────────────────────────────────────────────────────
 
 def _prepend_entry(entry: str) -> None:
-    """将新条目插入 digest.md 最前面，旧内容跟在后面（以 \n---\n 分隔）。原子写入防止进程崩溃导致内容丢失。"""
+    """将新条目插入 digest.md 最前面，旧内容跟在后面（以 \n---\n 分隔）。
+
+    原子写入：使用随机 UUID 命名的 .tmp 文件，避免多写者场景下 tmp 文件互相覆盖。
+    调用方须持有 _digest_lock 后再调用此函数。
+    """
     _DIGEST_PATH.parent.mkdir(parents=True, exist_ok=True)
     if _DIGEST_PATH.exists():
         try:
@@ -242,19 +283,40 @@ def _prepend_entry(entry: str) -> None:
         new_content = entry + "\n---\n\n" + old + "\n" if old else entry
     else:
         new_content = entry
-    # 原子写入：先写临时文件再 rename，防止写入过程中崩溃导致内容损坏
-    tmp = _DIGEST_PATH.with_suffix(".tmp")
-    tmp.write_text(new_content, encoding="utf-8")
-    tmp.replace(_DIGEST_PATH)
+    # 随机 tmp 名防止并发写者互相覆盖（_digest_lock 已防并发，此处是额外保险）
+    tmp = _DIGEST_PATH.with_name(f"digest.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        tmp.write_text(new_content, encoding="utf-8")
+        tmp.replace(_DIGEST_PATH)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _save_context_log(context: str, label: str) -> None:
+    """将送给 LLM 的原始上下文保存到 ~/.lumina/digest_context_log/，保留最近 20 份。"""
+    try:
+        _CONTEXT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = _CONTEXT_LOG_DIR / f"{ts}_{label}.txt"
+        log_file.write_text(context, encoding="utf-8")
+        # 只保留最近 20 份，按文件名（时间戳）排序，删最旧的
+        files = sorted(_CONTEXT_LOG_DIR.glob("*.txt"))
+        for old in files[:-20]:
+            old.unlink(missing_ok=True)
+    except Exception as e:
+        logger.debug("Digest: failed to save context log: %s", e)
 
 
 async def generate_digest(llm) -> str:
     """生成摘要，作为最新一条插入 digest.md 头部，历史记录永久保留。"""
     global _generating, _generated_at, _last_generated_ts
-    _generating = True
+    with _state_lock:
+        _generating = True
     try:
         # 全量生成不传 since_ts，使用 config.history_hours
         context = await _collect_all(since_ts=None)
+        _save_context_log(context, "full")
         logger.info("Digest: generating full summary...")
         summary = await llm.generate(
             context, task="chat",
@@ -266,22 +328,27 @@ async def generate_digest(llm) -> str:
                  f"# {now.strftime('%Y-%m-%d %H:%M')}\n\n"
                  + summary.strip() + "\n")
         _prepend_entry(entry)
-        _generated_at = now.isoformat()
-        _last_generated_ts = now.timestamp()
+        with _state_lock:
+            _generated_at = now.isoformat()
+            _last_generated_ts = now.timestamp()
         logger.info("Digest: saved to %s", _DIGEST_PATH)
         return entry
     finally:
-        _generating = False
+        with _state_lock:
+            _generating = False
 
 
 async def generate_changelog(llm) -> Optional[str]:
     """增量 Change Log：采集新活动并追加条目，collector 无新数据时 LLM 自行判断跳过。"""
     global _generating, _generated_at, _last_generated_ts
-    _generating = True
+    with _state_lock:
+        _generating = True
+        since_ts = _last_generated_ts
     try:
         # 增量生成：只采集上次生成到现在的数据
-        context = await _collect_all(since_ts=_last_generated_ts)
-        elapsed = (time.time() - _last_generated_ts) / 3600 if _last_generated_ts else None
+        context = await _collect_all(since_ts=since_ts)
+        _save_context_log(context, "changelog")
+        elapsed = (time.time() - since_ts) / 3600 if since_ts else None
         logger.info("Digest: generating changelog (window=%.1fh)...",
                     min(elapsed, get_cfg().history_hours) if elapsed else get_cfg().history_hours)
         changelog = await llm.generate(
@@ -298,12 +365,14 @@ async def generate_changelog(llm) -> Optional[str]:
                  f"# {now.strftime('%Y-%m-%d %H:%M')} 更新\n\n"
                  + changelog.strip() + "\n")
         _prepend_entry(entry)
-        _generated_at = now.isoformat()
-        _last_generated_ts = now.timestamp()
+        with _state_lock:
+            _generated_at = now.isoformat()
+            _last_generated_ts = now.timestamp()
         logger.info("Digest: changelog appended")
         return entry
     finally:
-        _generating = False
+        with _state_lock:
+            _generating = False
 
 
 # ── 对外接口 ──────────────────────────────────────────────────────────────────
@@ -311,29 +380,19 @@ async def generate_changelog(llm) -> Optional[str]:
 def _sync_status_from_digest_file() -> None:
     """进程重启后，从已有 digest.md 恢复最近一次生成时间。"""
     global _generated_at, _last_generated_ts
-    if _generated_at is not None or not _DIGEST_PATH.exists():
+    with _state_lock:
+        if _generated_at is not None:
+            return
+    if not _DIGEST_PATH.exists():
         return
     try:
         mtime = _DIGEST_PATH.stat().st_mtime
     except OSError:
         return
-    _generated_at = datetime.fromtimestamp(mtime).isoformat()
-    _last_generated_ts = mtime
+    with _state_lock:
+        _generated_at = datetime.fromtimestamp(mtime).isoformat()
+        _last_generated_ts = mtime
 
-
-def _clear_orphan_lock_if_needed() -> None:
-    """清理前一个进程遗留的 lock，避免手动刷新被静默跳过。"""
-    if not _LOCK_PATH.exists():
-        return
-    mtime = _LOCK_PATH.stat().st_mtime
-    age = time.time() - mtime
-    if mtime < _PROCESS_STARTED_TS:
-        logger.warning("Digest: removing orphan lock from previous process")
-        _LOCK_PATH.unlink(missing_ok=True)
-        return
-    if age >= 600:
-        logger.warning("Digest: stale lock (%.0fs old), removing", age)
-        _LOCK_PATH.unlink(missing_ok=True)
 
 
 def should_regenerate_full(max_age_hours: Optional[float] = None) -> bool:
@@ -351,13 +410,14 @@ def load_digest() -> Optional[str]:
 
 
 async def maybe_generate_digest(llm, force_full: bool = False) -> None:
-    """启动时调用：全量摘要（若需要）。用 lock 文件防并发。"""
+    """启动时调用：全量摘要（若需要）。用 asyncio.Lock 防并发。"""
     if not get_cfg().enabled:
         logger.info("Digest disabled, skipping full generation")
         return
     _sync_status_from_digest_file()
-    _clear_orphan_lock_if_needed()
-    if _LOCK_PATH.exists():
+
+    lock = _get_digest_lock()
+    if lock.locked():
         logger.debug("Digest: locked, skipping")
         return
 
@@ -365,13 +425,11 @@ async def maybe_generate_digest(llm, force_full: bool = False) -> None:
         logger.debug("Digest: still fresh, skipping full generation")
         return
 
-    try:
-        _LOCK_PATH.touch()
-        await generate_digest(llm)
-    except Exception as e:
-        logger.error("Digest full generation failed: %s", e)
-    finally:
-        _LOCK_PATH.unlink(missing_ok=True)
+    async with lock:
+        try:
+            await generate_digest(llm)
+        except Exception as e:
+            logger.error("Digest full generation failed: %s", e)
 
 
 async def maybe_generate_changelog(llm) -> None:
@@ -379,24 +437,27 @@ async def maybe_generate_changelog(llm) -> None:
     if not get_cfg().enabled:
         logger.info("Digest disabled, skipping changelog generation")
         return
-    if _LOCK_PATH.exists():
+
+    lock = _get_digest_lock()
+    if lock.locked():
+        logger.debug("Digest: locked, skipping changelog")
         return
-    try:
-        _LOCK_PATH.touch()
-        await generate_changelog(llm)
-    except Exception as e:
-        logger.error("Digest changelog failed: %s", e)
-    finally:
-        _LOCK_PATH.unlink(missing_ok=True)
+
+    async with lock:
+        try:
+            await generate_changelog(llm)
+        except Exception as e:
+            logger.error("Digest changelog failed: %s", e)
 
 
 def get_status() -> dict:
     _sync_status_from_digest_file()
-    return {
-        "enabled": get_cfg().enabled,
-        "generating": _generating,
-        "generated_at": _generated_at,
-    }
+    with _state_lock:
+        return {
+            "enabled": get_cfg().enabled,
+            "generating": _generating,
+            "generated_at": _generated_at,
+        }
 
 
 def get_debug_info() -> dict:
@@ -404,14 +465,17 @@ def get_debug_info() -> dict:
     from lumina.digest.config import get_cfg
     import lumina.digest.collectors as _col
     cfg = get_cfg()
+    with _state_lock:
+        last_ts = _last_generated_ts
+        collectors_snapshot = dict(_last_collector_results)
     return {
         "config": {
             "scan_dirs": cfg.scan_dirs,
             "history_hours": cfg.history_hours,
             "refresh_hours": cfg.refresh_hours,
         },
-        "last_generated_ts": _last_generated_ts,
-        "collectors": _last_collector_results,
+        "last_generated_ts": last_ts,
+        "collectors": collectors_snapshot,
         "cursors": load_cursors(),
         "md_files": _col._last_md_files,
     }

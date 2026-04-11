@@ -67,6 +67,8 @@ _SERVER_START_TIME = time.time()
 
 def create_app(llm: LLMEngine, transcriber: Transcriber) -> FastAPI:
     app = FastAPI(title="Lumina", version=_LUMINA_VERSION)
+    # 保存后台 task 引用，防止 GC 提前回收未完成的 task
+    _bg_tasks: set = set()
 
     app.add_middleware(
         CORSMiddleware,
@@ -117,7 +119,7 @@ def create_app(llm: LLMEngine, transcriber: Transcriber) -> FastAPI:
         return put_cache(url, resp.content)
 
     async def _run_translate_job(job_id: str, pdf_path: str, lang_out: str):
-        """后台翻译任务，结果写入 _pdf_jobs。"""
+        """后台翻译任务，结果写入 _pdf_jobs。完成后立即结束，清理由独立 task 负责。"""
         import asyncio as _asyncio
         loop = _asyncio.get_running_loop()
         try:
@@ -138,12 +140,21 @@ def create_app(llm: LLMEngine, transcriber: Transcriber) -> FastAPI:
         except Exception as e:
             _pdf_jobs[job_id].update({"status": "error", "error": str(e)})
         finally:
-            # 300 秒后删临时目录（给用户时间下载），1 小时后清理 job 记录
+            # 300 秒后删临时目录（给用户时间下载）；1 小时后清理 job 记录
+            # 两个独立 task：主任务到此结束，不再被 sleep 占用
             tmp_dir = _pdf_jobs.get(job_id, {}).get("dir")
             if tmp_dir:
-                _asyncio.create_task(_delayed_rmtree(tmp_dir, delay=300))
-            await _asyncio.sleep(3600)
-            _pdf_jobs.pop(job_id, None)
+                t1 = _asyncio.create_task(_delayed_rmtree(tmp_dir, delay=300))
+                _bg_tasks.add(t1)
+                t1.add_done_callback(_bg_tasks.discard)
+
+            async def _cleanup_job(jid: str):
+                await _asyncio.sleep(3600)
+                _pdf_jobs.pop(jid, None)
+
+            t2 = _asyncio.create_task(_cleanup_job(job_id))
+            _bg_tasks.add(t2)
+            t2.add_done_callback(_bg_tasks.discard)
 
     async def _extract_and_stream_summary(pdf_path: str):
         """提取 PDF 文字，流式生成摘要，yield SSE 数据行。"""
@@ -169,7 +180,9 @@ def create_app(llm: LLMEngine, transcriber: Transcriber) -> FastAPI:
 
         job_id = uuid.uuid4().hex
         _pdf_jobs[job_id] = {"status": "running", "dir": tmp_dir, "ts": time.time()}
-        asyncio.create_task(_run_translate_job(job_id, pdf_path, lang_out))
+        task = asyncio.create_task(_run_translate_job(job_id, pdf_path, lang_out))
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
         return {"job_id": job_id}
 
     @app.post("/v1/pdf/url")
@@ -188,7 +201,9 @@ def create_app(llm: LLMEngine, transcriber: Transcriber) -> FastAPI:
         tmp_dir = tempfile.mkdtemp(prefix="lumina_out_")
         job_id = uuid.uuid4().hex
         _pdf_jobs[job_id] = {"status": "running", "dir": tmp_dir, "ts": time.time()}
-        asyncio.create_task(_run_translate_job(job_id, str(pdf_path), lang_out))
+        task = asyncio.create_task(_run_translate_job(job_id, str(pdf_path), lang_out))
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
         return {"job_id": job_id}
 
     @app.get("/v1/pdf/job/{job_id}")
@@ -201,8 +216,10 @@ def create_app(llm: LLMEngine, transcriber: Transcriber) -> FastAPI:
     @app.get("/v1/pdf/download/{job_id}/{variant}")
     async def pdf_download(job_id: str, variant: str):
         job = _pdf_jobs.get(job_id)
-        if not job or job["status"] != "done":
-            raise HTTPException(404, "Job not ready")
+        if not job:
+            raise HTTPException(404, "Job not found")
+        if job["status"] != "done":
+            raise HTTPException(409, "Job not ready")
         key = "mono" if variant == "mono" else "dual"
         path = job.get(key)
         if not path or not Path(path).exists():
@@ -474,5 +491,7 @@ async def raw_request_disconnected(request) -> bool:
     """辅助函数，检查客户端是否断开（流式场景）。"""
     try:
         return await asyncio.wait_for(request.is_disconnected(), timeout=0.001)
+    except asyncio.TimeoutError:
+        return False
     except Exception:
         return False

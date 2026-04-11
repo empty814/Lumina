@@ -69,7 +69,7 @@ def configure(data: dict) -> None:
         refresh_hours=float(d.get("refresh_hours", 1.0)),
         notify_time=str(d.get("notify_time", "20:00")),
         enabled_collectors=d.get("enabled_collectors", None),
-        enabled=bool(d.get("enabled", True)),
+        enabled=bool(d.get("enabled", False)),
     )
 
 

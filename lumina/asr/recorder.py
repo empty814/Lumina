@@ -11,10 +11,8 @@
 """
 import asyncio
 import io
-import queue
 import threading
 import wave
-from typing import Optional
 
 import numpy as np
 import sounddevice as sd

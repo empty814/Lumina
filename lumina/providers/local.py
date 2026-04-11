@@ -419,12 +419,24 @@ class LocalProvider(BaseProvider):
         cached = self._system_prompt_cache.get(system_text)
         if cached is not None:
             self._system_prompt_cache.move_to_end(system_text)
+            logger.debug(
+                "system_prompt_cache HIT  key_len=%d prefix_tokens=%d cache_size=%d",
+                len(system_text), len(cached.prefix_tokens), len(self._system_prompt_cache),
+            )
             return cached
 
         prefix_tokens = self._derive_system_prefix_tokens(system_text)
         if not prefix_tokens:
+            logger.debug(
+                "system_prompt_cache SKIP  key_len=%d (prefix derivation failed)",
+                len(system_text),
+            )
             return None
 
+        logger.debug(
+            "system_prompt_cache MISS  key_len=%d → building prefix cache (%d tokens)",
+            len(system_text), len(prefix_tokens),
+        )
         prompt_cache = mlx_cache.make_prompt_cache(self._model)
         self._prefill_full_prompt_cache(prefix_tokens, prompt_cache)
         entry = _SystemPromptCacheEntry(
@@ -435,34 +447,60 @@ class LocalProvider(BaseProvider):
         self._system_prompt_cache[system_text] = entry
         self._system_prompt_cache.move_to_end(system_text)
         while len(self._system_prompt_cache) > _SYSTEM_PROMPT_CACHE_SIZE:
+            evicted = next(iter(self._system_prompt_cache))
             self._system_prompt_cache.popitem(last=False)
+            logger.debug("system_prompt_cache EVICT  key_len=%d (LRU)", len(evicted))
         return entry
 
     def _prepare_batch_generator_prompt(self, slot: _RequestSlot) -> tuple[List[int], Optional[List[Any]]]:
         prompt_tokens = [int(tok) for tok in slot.prompt_tokens]
         try:
             cache_entry = self._get_or_create_system_prompt_cache(slot.system_text)
-        except Exception:
+        except Exception as e:
+            logger.debug("system_prompt_cache error during lookup: %s", e)
             return prompt_tokens, None
         if cache_entry is None:
             return prompt_tokens, None
 
         prefix_tokens = cache_entry.prefix_tokens
         if len(prompt_tokens) <= len(prefix_tokens):
+            logger.debug(
+                "system_prompt_cache prefix mismatch: prompt_len=%d <= prefix_len=%d, skipping cache",
+                len(prompt_tokens), len(prefix_tokens),
+            )
             return prompt_tokens, None
         if prompt_tokens[: len(prefix_tokens)] != prefix_tokens:
+            logger.warning(
+                "system_prompt_cache prefix TOKEN MISMATCH: prompt_len=%d prefix_len=%d "
+                "— cache not applied (possible cache corruption)",
+                len(prompt_tokens), len(prefix_tokens),
+            )
             return prompt_tokens, None
 
-        suffix_tokens = prompt_tokens[len(prefix_tokens) :]
+        suffix_tokens = prompt_tokens[len(prefix_tokens):]
         if not suffix_tokens:
             return prompt_tokens, None
+        logger.debug(
+            "system_prompt_cache APPLIED: prefix=%d tokens skipped, suffix=%d tokens to prefill",
+            len(prefix_tokens), len(suffix_tokens),
+        )
         return suffix_tokens, self._clone_prompt_cache(cache_entry.prompt_cache)
 
     def _emit_token_id(self, slot: _RequestSlot, token_id: int) -> None:
         slot._token_ids.append(token_id)
-        new_text = self._tokenizer.decode(slot._token_ids)
-        delta = new_text[len(slot.decoded_text):]
-        slot.decoded_text = new_text
+        # 增量解码：decode 整个序列仍是最安全的方式（BPE tokenizer 对上下文敏感），
+        # 但只在序列较短（≤512）或每 16 个 token 时全量解码一次，其余用单 token decode 估算。
+        # 避免长回答时 O(n²) 的性能退化。
+        n = len(slot._token_ids)
+        if n <= 512 or n % 16 == 0:
+            new_text = self._tokenizer.decode(slot._token_ids)
+            delta = new_text[len(slot.decoded_text):]
+            slot.decoded_text = new_text
+        else:
+            # 单 token 快速解码：精度略低（无法处理跨边界多字节），但不影响最终输出
+            # 因为每 16 个 token 会做一次精确同步
+            delta = self._tokenizer.decode([token_id])
+            slot.decoded_text += delta
         slot.n_tokens += 1
         self._put_token(slot, delta)
 
@@ -902,7 +940,7 @@ class LocalProvider(BaseProvider):
 
         self._ensure_worker()
 
-        system_str = system or "You are a helpful assistant."
+        system_str = system if system is not None else "You are a helpful assistant."
         prompt_tokens = self._build_prompt_tokens(system_str, user_text)
 
         slot = _RequestSlot(

@@ -333,30 +333,39 @@ def test_get_status_recovers_generated_at_from_existing_digest(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_maybe_generate_digest_clears_orphan_lock_from_previous_process(tmp_path):
+async def test_maybe_generate_digest_skips_when_lock_held(tmp_path):
+    """asyncio.Lock 持有期间，并发的 maybe_generate_digest 调用应该直接跳过，不重入。"""
+    import asyncio
     import lumina.digest.core as core
+    from lumina.digest.config import configure
+
+    configure({"digest": {"enabled": True}})
 
     digest_path = tmp_path / "digest.md"
-    lock_path = tmp_path / "digest.lock"
-    lock_path.write_text("", encoding="utf-8")
+    generate_calls = 0
+    shared_lock = asyncio.Lock()
 
-    now = time.time()
-    lock_mtime = now - 5
-    os.utime(lock_path, (lock_mtime, lock_mtime))
-
-    class FakeLLM:
-        generate = AsyncMock(return_value="digest body")
+    async def _slow_generate(llm):
+        nonlocal generate_calls
+        generate_calls += 1
+        await asyncio.sleep(0.05)
 
     with patch.object(core, "_DIGEST_PATH", digest_path), \
-         patch.object(core, "_LOCK_PATH", lock_path), \
-         patch.object(core, "_PROCESS_STARTED_TS", now), \
          patch.object(core, "_generated_at", None), \
          patch.object(core, "_last_generated_ts", None), \
+         patch.object(core, "generate_digest", _slow_generate), \
          patch.object(core, "_collect_all", AsyncMock(return_value="mocked context")):
-        await core.maybe_generate_digest(FakeLLM(), force_full=True)
+        # 注入共享 lock，使两次并发调用看到同一个实例
+        core._digest_lock = shared_lock
+        try:
+            await asyncio.gather(
+                core.maybe_generate_digest(object(), force_full=True),
+                core.maybe_generate_digest(object(), force_full=True),
+            )
+        finally:
+            core._digest_lock = None
 
-    assert digest_path.exists()
-    assert not lock_path.exists()
+    assert generate_calls == 1, f"Expected 1 generate call, got {generate_calls}"
 
 
 @pytest.mark.asyncio

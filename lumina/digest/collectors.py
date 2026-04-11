@@ -281,16 +281,15 @@ def collect_browser_history(n: int = 50) -> str:
                 pass
             shutil.copy2(str(chrome_db), str(tmp))
             try:
-                conn = sqlite3.connect(str(tmp))
-                chrome_offset = 11644473600 * 1_000_000
-                cutoff_chrome = int(cursor * 1_000_000 + chrome_offset)
-                rows = conn.execute(
-                    "SELECT title, url, last_visit_time FROM urls "
-                    "WHERE last_visit_time > ? "
-                    "ORDER BY last_visit_time DESC LIMIT ?",
-                    (cutoff_chrome, n)
-                ).fetchall()
-                conn.close()
+                with sqlite3.connect(str(tmp)) as conn:
+                    chrome_offset = 11644473600 * 1_000_000
+                    cutoff_chrome = int(cursor * 1_000_000 + chrome_offset)
+                    rows = conn.execute(
+                        "SELECT title, url, last_visit_time FROM urls "
+                        "WHERE last_visit_time > ? "
+                        "ORDER BY last_visit_time DESC LIMIT ?",
+                        (cutoff_chrome, n)
+                    ).fetchall()
                 for title, url, lv_time in rows:
                     results.append(title or url)
                     ts_unix = (lv_time - chrome_offset) / 1_000_000
@@ -319,15 +318,14 @@ def collect_browser_history(n: int = 50) -> str:
                     pass
                 shutil.copy2(str(places_db), str(tmp))
                 try:
-                    conn = sqlite3.connect(str(tmp))
-                    cutoff_ff = int(cursor * 1_000_000)
-                    rows = conn.execute(
-                        "SELECT title, url, last_visit_date FROM moz_places "
-                        "WHERE last_visit_date > ? "
-                        "ORDER BY last_visit_date DESC LIMIT ?",
-                        (cutoff_ff, n)
-                    ).fetchall()
-                    conn.close()
+                    with sqlite3.connect(str(tmp)) as conn:
+                        cutoff_ff = int(cursor * 1_000_000)
+                        rows = conn.execute(
+                            "SELECT title, url, last_visit_date FROM moz_places "
+                            "WHERE last_visit_date > ? "
+                            "ORDER BY last_visit_date DESC LIMIT ?",
+                            (cutoff_ff, n)
+                        ).fetchall()
                     for title, url, lv_date in rows:
                         results.append(title or url)
                         if lv_date:
@@ -381,27 +379,26 @@ def collect_notes_app() -> str:
 
         import shutil as _shutil
         tmp_dir = tempfile.mkdtemp(prefix="lumina_notes_")
-        tmp_db = Path(tmp_dir) / "notes.db"
-        _shutil.copy2(str(db_path), str(tmp_db))
-        # 必须同时复制 WAL / SHM，否则 Notes.app 写入的未 checkpoint 数据会丢失
-        for suffix in ("-wal", "-shm"):
-            src = db_path.with_name(db_path.name + suffix)
-            if src.exists():
-                try:
-                    _shutil.copy2(str(src), str(tmp_db.with_name(tmp_db.name + suffix)))
-                except Exception:
-                    pass
-        conn = _sqlite3.connect(str(tmp_db))
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT ZTITLE1, ZSNIPPET, ZMODIFICATIONDATE1 FROM ZICCLOUDSYNCINGOBJECT "
-            "WHERE ZMODIFICATIONDATE1 > ? AND ZTITLE1 IS NOT NULL "
-            "ORDER BY ZMODIFICATIONDATE1 DESC LIMIT 20",
-            (cursor_core,),
-        )
-        rows = cur.fetchall()
-        conn.close()
-        _shutil.rmtree(tmp_dir, ignore_errors=True)
+        try:
+            tmp_db = Path(tmp_dir) / "notes.db"
+            _shutil.copy2(str(db_path), str(tmp_db))
+            # 必须同时复制 WAL / SHM，否则 Notes.app 写入的未 checkpoint 数据会丢失
+            for suffix in ("-wal", "-shm"):
+                src = db_path.with_name(db_path.name + suffix)
+                if src.exists():
+                    try:
+                        _shutil.copy2(str(src), str(tmp_db.with_name(tmp_db.name + suffix)))
+                    except Exception:
+                        pass
+            with _sqlite3.connect(str(tmp_db)) as conn:
+                rows = conn.execute(
+                    "SELECT ZTITLE1, ZSNIPPET, ZMODIFICATIONDATE1 FROM ZICCLOUDSYNCINGOBJECT "
+                    "WHERE ZMODIFICATIONDATE1 > ? AND ZTITLE1 IS NOT NULL "
+                    "ORDER BY ZMODIFICATIONDATE1 DESC LIMIT 20",
+                    (cursor_core,),
+                ).fetchall()
+        finally:
+            _shutil.rmtree(tmp_dir, ignore_errors=True)
 
         if not rows:
             return ""
@@ -451,43 +448,44 @@ def collect_calendar() -> str:
             return ""
 
         tmp_cal_dir = tempfile.mkdtemp(prefix="lumina_calendar_")
-        tmp_db = Path(tmp_cal_dir) / "calendar.db"
-        shutil.copy2(str(_CALENDAR_DB), str(tmp_db))
-        for suffix in ("-wal", "-shm"):
-            src = _CALENDAR_DB.with_name(_CALENDAR_DB.name + suffix)
-            if src.exists():
-                try:
-                    shutil.copy2(str(src), str(tmp_db.with_name(tmp_db.name + suffix)))
-                except Exception:
-                    pass
+        try:
+            tmp_db = Path(tmp_cal_dir) / "calendar.db"
+            shutil.copy2(str(_CALENDAR_DB), str(tmp_db))
+            for suffix in ("-wal", "-shm"):
+                src = _CALENDAR_DB.with_name(_CALENDAR_DB.name + suffix)
+                if src.exists():
+                    try:
+                        shutil.copy2(str(src), str(tmp_db.with_name(tmp_db.name + suffix)))
+                    except Exception:
+                        pass
 
-        conn = sqlite3.connect(str(tmp_db))
-        now = time.time()
-        now_core = now - _CALENDAR_CORE_OFFSET
+            now = time.time()
+            now_core = now - _CALENDAR_CORE_OFFSET
 
-        # 窗口：从今天 0 点到 history_hours 之后
-        from datetime import date
-        today_midnight = datetime.combine(date.today(), datetime.min.time()).timestamp()
-        window_start = today_midnight - _CALENDAR_CORE_OFFSET
-        window_end = now_core + cfg.history_hours * 3600
+            # 窗口：从今天 0 点到 history_hours 之后
+            from datetime import date
+            today_midnight = datetime.combine(date.today(), datetime.min.time()).timestamp()
+            window_start = today_midnight - _CALENDAR_CORE_OFFSET
+            window_end = now_core + cfg.history_hours * 3600
 
-        rows = conn.execute(
-            """
-            SELECT oc.occurrence_date, oc.occurrence_end_date,
-                   ci.summary, ci.all_day, ci.description,
-                   c.title as cal_title
-            FROM OccurrenceCache oc
-            JOIN CalendarItem ci ON oc.event_id = ci.ROWID
-            LEFT JOIN Calendar c ON oc.calendar_id = c.ROWID
-            WHERE oc.day >= ? AND oc.day <= ?
-              AND ci.hidden = 0
-            ORDER BY oc.occurrence_date
-            LIMIT 30
-            """,
-            (window_start, window_end),
-        ).fetchall()
-        conn.close()
-        shutil.rmtree(tmp_cal_dir, ignore_errors=True)
+            with sqlite3.connect(str(tmp_db)) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT oc.occurrence_date, oc.occurrence_end_date,
+                           ci.summary, ci.all_day, ci.description,
+                           c.title as cal_title
+                    FROM OccurrenceCache oc
+                    JOIN CalendarItem ci ON oc.event_id = ci.ROWID
+                    LEFT JOIN Calendar c ON oc.calendar_id = c.ROWID
+                    WHERE oc.day >= ? AND oc.day <= ?
+                      AND ci.hidden = 0
+                    ORDER BY oc.occurrence_date
+                    LIMIT 30
+                    """,
+                    (window_start, window_end),
+                ).fetchall()
+        finally:
+            shutil.rmtree(tmp_cal_dir, ignore_errors=True)
 
         if not rows:
             return ""
@@ -571,10 +569,6 @@ def collect_markdown_notes() -> str:
         candidates.sort(key=lambda x: -x[0])
         newest_ts = candidates[0][0]
 
-        # 所有候选文件都记录 hash（不只是 top10），确保下次不会重复采集
-        for _, md, current_hash in candidates:
-            hashes[str(md)] = current_hash
-
         entries = []
         for mtime, md, _ in candidates[:10]:
             try:
@@ -584,9 +578,12 @@ def collect_markdown_notes() -> str:
             except Exception:
                 continue
 
-        save_md_hashes(hashes)
-        # cursor 退 1 秒，防止同一秒内其他文件在下次采集时因 mtime == cursor 被过滤
-        if newest_ts is not None:
+        # 只有真正产出内容后才推进 hash 和 cursor，避免临时 IO 失败导致文件被永久跳过
+        if entries:
+            for _, md, current_hash in candidates:
+                hashes[str(md)] = current_hash
+            save_md_hashes(hashes)
+            # cursor 退 1 秒，防止同一秒内其他文件在下次采集时因 mtime == cursor 被过滤
             _set_cursor(name, newest_ts - 1)
 
         if not entries:
@@ -728,12 +725,11 @@ def collect_ai_queries(n: int = 50) -> str:
                     pass
                 try:
                     shutil.copy2(str(cursor_db), str(tmp))
-                    conn = sqlite3.connect(str(tmp))
-                    rows = conn.execute(
-                        "SELECT value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'"
-                        " AND length(value) < 4000"
-                    ).fetchall()
-                    conn.close()
+                    with sqlite3.connect(str(tmp)) as conn:
+                        rows = conn.execute(
+                            "SELECT value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'"
+                            " AND length(value) < 4000"
+                        ).fetchall()
                     for (value,) in rows:
                         try:
                             val = (bytes(value).decode("utf-8", errors="replace")

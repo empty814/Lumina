@@ -2,7 +2,6 @@
 
 你的 Mac 上运行的私人 AI 工具箱。不联网，不收费，不上传任何数据。
 
-[![Release](https://img.shields.io/github/v/release/wnma3mz/Lumina)](https://github.com/wnma3mz/Lumina/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-black)](https://github.com/wnma3mz/Lumina)
 [![License](https://img.shields.io/github/license/wnma3mz/Lumina)](LICENSE)
 
@@ -26,17 +25,7 @@
 
 ## 快速开始
 
-### 方式一：下载 .app（推荐普通用户）
-
-**[→ 点击前往 Releases 下载最新版](https://github.com/wnma3mz/Lumina/releases/latest)**
-
-1. 下载 `Lumina.zip` 并解压
-2. 双击 **`install.command`**
-3. 启动「应用程序」中的 Lumina
-
-首次启动会自动下载模型（Qwen3.5-0.8B-4bit，约 622MB），下载完成后弹出「Lumina 已就绪」通知。
-
-### 方式二：命令行安装（开发者）
+### 命令行安装
 
 ```bash
 git clone https://github.com/wnma3mz/Lumina.git
@@ -45,21 +34,13 @@ uv sync                        # 安装依赖（需要 uv）
 uv run lumina server           # 启动服务
 ```
 
-命令行模式与 .app 模式功能完全一致，包括菜单栏图标和每小时日报。
-
 ---
 
 ## 使用方式
 
 ### PDF 翻译 / 总结
 
-**Finder 右键（需先安装 Quick Action）：**
-
-```bash
-bash scripts/install_quick_action.sh
-```
-
-安装后：选中 PDF → 右键 → **快速操作** → 翻译 / 总结
+选中 PDF → 右键 → **快速操作** → 翻译 / 总结
 
 输出文件：
 - `文件名-mono.pdf` — 纯中文版
@@ -247,17 +228,3 @@ scripts/
 ```
 
 </details>
-
----
-
-## 要求
-
-- Apple Silicon Mac（M1 及以上）
-- macOS 13 Ventura 及以上
-- 命令行安装需要 [uv](https://github.com/astral-sh/uv)
-
----
-
-## License
-
-MIT

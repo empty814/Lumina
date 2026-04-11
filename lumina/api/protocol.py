@@ -13,7 +13,7 @@ OpenAI 兼容协议 + 扩展。
 """
 import time
 import uuid
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 

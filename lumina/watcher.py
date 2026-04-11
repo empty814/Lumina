@@ -92,7 +92,8 @@ def watch(
         from watchdog.events import FileSystemEventHandler
     except ImportError:
         logger.error("watchdog 未安装，请运行: uv add watchdog")
-        import sys; sys.exit(1)
+        import sys
+        sys.exit(1)
 
     handler_core = _PDFHandler(base_url, model, api_key, lang_in, lang_out, threads)
 
