@@ -191,4 +191,4 @@ uv run --with ruff ruff check --fix <改动的文件...>
 
 ## 版本
 
-当前：`v0.6.0`（`pyproject.toml` 和 `scripts/lumina_full.spec` 中的 `CFBundleShortVersionString`）
+当前：`v0.7.0`（`pyproject.toml` 和 `scripts/lumina_full.spec` 中的 `CFBundleShortVersionString`）
