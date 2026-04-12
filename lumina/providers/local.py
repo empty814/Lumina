@@ -346,19 +346,12 @@ class LocalProvider(BaseProvider):
 
     def _emit_token_id(self, slot: _RequestSlot, token_id: int) -> None:
         slot._token_ids.append(token_id)
-        # 增量解码：decode 整个序列仍是最安全的方式（BPE tokenizer 对上下文敏感），
-        # 但只在序列较短（≤512）或每 16 个 token 时全量解码一次，其余用单 token decode 估算。
-        # 避免长回答时 O(n²) 的性能退化。
-        n = len(slot._token_ids)
-        if n <= 512 or n % 16 == 0:
-            new_text = self._tokenizer.decode(slot._token_ids)
-            delta = new_text[len(slot.decoded_text):]
-            slot.decoded_text = new_text
-        else:
-            # 单 token 快速解码：精度略低（无法处理跨边界多字节），但不影响最终输出
-            # 因为每 16 个 token 会做一次精确同步
-            delta = self._tokenizer.decode([token_id])
-            slot.decoded_text += delta
+        # 始终全量解码：BPE tokenizer 对上下文敏感，单独 decode 单个 token 在多字节
+        # 字符（中文、emoji 等）跨 token 边界时会产生乱码（U+FFFD）。
+        # GPU 推理是实际瓶颈，CPU decode 的 O(n) 开销可忽略不计。
+        new_text = self._tokenizer.decode(slot._token_ids)
+        delta = new_text[len(slot.decoded_text):]
+        slot.decoded_text = new_text
         slot.n_tokens += 1
         self._put_token(slot, delta)
 
@@ -368,16 +361,10 @@ class LocalProvider(BaseProvider):
 
     def _emit_token_id_local(self, slot: _RequestSlot, token_id: int) -> None:
         slot._token_ids.append(token_id)
-        # 增量解码：≤512 token 或每 16 步全量校准一次，其余用单 token 快速估算。
-        # 避免长回答时 O(n²) decode 阻塞事件循环主线程。
-        n = len(slot._token_ids)
-        if n <= 512 or n % 16 == 0:
-            new_text = self._tokenizer.decode(slot._token_ids)
-            delta = new_text[len(slot.decoded_text):]
-            slot.decoded_text = new_text
-        else:
-            delta = self._tokenizer.decode([token_id])
-            slot.decoded_text += delta
+        # 始终全量解码，理由同 _emit_token_id。
+        new_text = self._tokenizer.decode(slot._token_ids)
+        delta = new_text[len(slot.decoded_text):]
+        slot.decoded_text = new_text
         slot.n_tokens += 1
         self._put_token_local(slot, delta)
 
