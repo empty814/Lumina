@@ -1,40 +1,34 @@
 """
 lumina/digest/collectors — 各数据源采集函数包
 
-子模块：
-  system.py  — 终端历史、Git 提交、剪贴板
-  apps.py    — 浏览器历史、备忘录、日历、AI 对话
-  files.py   — 本地 Markdown 笔记
+约定：在此包下的子模块（base 除外）中，所有名为 collect_* 的函数
+自动被发现并注册到 COLLECTORS 列表。新增数据源只需建文件、写函数，
+无需修改本文件。
 """
-from .apps import (
-    collect_ai_queries,
-    collect_browser_history,
-    collect_calendar,
-    collect_notes_app,
-)
-from .files import _last_md_files, collect_markdown_notes
-from .system import collect_clipboard, collect_git_logs, collect_shell_history
+import importlib
+import pkgutil
+from pathlib import Path
 
-COLLECTORS = [
-    collect_shell_history,
-    collect_git_logs,
-    collect_clipboard,
-    collect_browser_history,
-    collect_calendar,
-    collect_notes_app,
-    collect_markdown_notes,
-    collect_ai_queries,
-]
+from lumina.digest.collectors.base import Collector
 
-__all__ = [
-    "collect_shell_history",
-    "collect_git_logs",
-    "collect_clipboard",
-    "collect_browser_history",
-    "collect_notes_app",
-    "collect_calendar",
-    "collect_markdown_notes",
-    "collect_ai_queries",
-    "_last_md_files",
-    "COLLECTORS",
-]
+_SKIP_MODULES = {"base"}
+
+
+def _discover() -> list[Collector]:
+    """扫描包内所有子模块，收集满足 Collector Protocol 的 collect_* 函数。"""
+    discovered: list[Collector] = []
+    pkg_path = str(Path(__file__).parent)
+    for mod_info in pkgutil.iter_modules([pkg_path]):
+        if mod_info.name in _SKIP_MODULES:
+            continue
+        mod = importlib.import_module(f"{__package__}.{mod_info.name}")
+        for attr_name in dir(mod):
+            if not attr_name.startswith("collect_"):
+                continue
+            obj = getattr(mod, attr_name)
+            if callable(obj) and isinstance(obj, Collector):
+                discovered.append(obj)
+    return discovered
+
+
+COLLECTORS = _discover()

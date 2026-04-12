@@ -410,3 +410,30 @@ async def test_maybe_generate_digest_skips_when_disabled():
         mocked_generate.assert_not_called()
     finally:
         configure({"digest": {"enabled": True}})
+
+
+def test_collectors_auto_discovered():
+    """COLLECTORS 自动发现到所有内置 collect_* 函数。"""
+    from lumina.digest.collectors import COLLECTORS
+
+    names = {fn.__name__ for fn in COLLECTORS}
+    expected = {
+        "collect_shell_history",
+        "collect_git_logs",
+        "collect_clipboard",
+        "collect_browser_history",
+        "collect_notes_app",
+        "collect_calendar",
+        "collect_markdown_notes",
+        "collect_ai_queries",
+    }
+    assert expected.issubset(names)
+
+
+def test_collector_protocol_satisfied():
+    """所有 COLLECTORS 条目满足 Collector Protocol。"""
+    from lumina.digest.collectors import COLLECTORS
+    from lumina.digest.collectors.base import Collector
+
+    for fn in COLLECTORS:
+        assert isinstance(fn, Collector), f"{fn.__name__} does not satisfy Collector protocol"
