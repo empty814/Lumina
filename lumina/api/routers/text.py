@@ -1,9 +1,6 @@
 """
 lumina/api/routers/text.py — 翻译 / 摘要 / 润色路由
 """
-import json
-import logging
-
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
@@ -13,10 +10,9 @@ from lumina.api.protocol import (
     TextResponse,
     TranslateRequest,
 )
+from lumina.api.sse import stream_llm
 
 router = APIRouter(tags=["text"])
-
-logger = logging.getLogger("lumina")
 
 
 @router.post("/v1/translate")
@@ -58,10 +54,5 @@ async def polish(request: PolishRequest, raw: Request):
 
 
 async def _stream_text(user_text: str, task: str, llm):
-    try:
-        async for token in llm.generate_stream(user_text, task=task):
-            yield f"data: {json.dumps({'text': token})}\n\n"
-    except Exception as e:
-        logger.error("stream_text error: %s", e)
-        yield f"data: {json.dumps({'error': str(e)})}\n\n"
-    yield "data: [DONE]\n\n"
+    async for chunk in stream_llm(llm, user_text, task=task, log_label="stream_text"):
+        yield chunk

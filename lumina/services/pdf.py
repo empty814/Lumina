@@ -9,8 +9,6 @@ lumina/services/pdf.py — PDF 翻译 & 摘要服务层
     stream_pdf_summary — 无状态：pdf_path → AsyncIterator[str]（SSE 行）
 """
 import asyncio
-import json
-import logging
 import os
 import shutil
 import tempfile
@@ -20,8 +18,6 @@ from pathlib import Path
 from typing import AsyncIterator, Optional
 
 import httpx
-
-logger = logging.getLogger("lumina")
 
 
 # ── 无状态辅助函数 ─────────────────────────────────────────────────────────────
@@ -58,31 +54,11 @@ async def fetch_pdf_url(url: str) -> Path:
 
 async def stream_pdf_summary(pdf_path: str, llm) -> AsyncIterator[str]:
     """提取 PDF 文字，流式生成摘要，yield SSE 数据行。"""
-    import fitz
-
-    def _extract_text() -> str:
-        doc = fitz.open(pdf_path)
-        try:
-            chunks = []
-            total = 0
-            for p in doc:
-                chunk = p.get_text()
-                chunks.append(chunk)
-                total += len(chunk)
-                if total >= 8000:
-                    break
-            return "".join(chunks)[:8000]
-        finally:
-            doc.close()
-
-    text = await asyncio.to_thread(_extract_text)
-    try:
-        async for token in llm.generate_stream(text, task="summarize"):
-            yield f"data: {json.dumps({'text': token})}\n\n"
-    except Exception as e:
-        logger.error("stream_summary error: %s", e)
-        yield f"data: {json.dumps({'error': str(e)})}\n\n"
-    yield "data: [DONE]\n\n"
+    from lumina.pdf_summarize import _extract_text
+    from lumina.api.sse import stream_llm
+    text = await asyncio.to_thread(_extract_text, pdf_path)
+    async for chunk in stream_llm(llm, text, task="summarize", log_label="stream_summary"):
+        yield chunk
 
 
 # ── PdfJobManager ─────────────────────────────────────────────────────────────
