@@ -22,6 +22,7 @@ import pytest
 mx = pytest.importorskip("mlx.core", reason="mlx not available on this platform")
 
 import lumina.providers.local as local_mod  # noqa: E402
+import lumina.providers.mlx_loader as mlx_loader_mod  # noqa: E402
 from lumina.providers.local import LocalProvider, _RequestSlot  # noqa: E402
 
 
@@ -314,6 +315,7 @@ async def test_batch_engine_matches_legacy_scheduler_outputs():
     legacy_provider = LegacySchedulerProvider(str(MODEL_PATH))
     legacy_provider._model = batch_provider._model
     legacy_provider._tokenizer = batch_provider._tokenizer
+    legacy_provider._prompt_builder = batch_provider._prompt_builder
 
     prompts = [
         "请用一句话解释 continuous batching。",
@@ -331,12 +333,16 @@ async def test_batch_engine_matches_legacy_scheduler_outputs():
     assert batch_results == legacy_results
 
 
+def _fake_loader_load():
+    """MlxModelLoader.load 的替代：返回 (FakeModel, FakeTokenizer, None, None)。"""
+    return FakeLoadedModel(), FakeLoadedTokenizer(), None, None
+
+
 def test_load_runs_warmup_by_default(monkeypatch):
     provider = LocalProvider(model_path="synthetic")
     warmup_calls = []
 
-    monkeypatch.setattr(local_mod, "load", lambda model_path: (FakeLoadedModel(), FakeLoadedTokenizer()))
-    monkeypatch.setattr(provider, "_init_batch_engine", lambda: None)
+    monkeypatch.setattr(provider._loader, "load", _fake_loader_load)
     monkeypatch.setattr(provider, "_run_warmup", lambda: warmup_calls.append("warmup"))
 
     provider.load()
@@ -348,8 +354,7 @@ def test_load_skips_warmup_when_disabled(monkeypatch):
     provider = LocalProvider(model_path="synthetic", enable_warmup=False)
     warmup_calls = []
 
-    monkeypatch.setattr(local_mod, "load", lambda model_path: (FakeLoadedModel(), FakeLoadedTokenizer()))
-    monkeypatch.setattr(provider, "_init_batch_engine", lambda: None)
+    monkeypatch.setattr(provider._loader, "load", _fake_loader_load)
     monkeypatch.setattr(provider, "_run_warmup", lambda: warmup_calls.append("warmup"))
 
     provider.load()
@@ -360,8 +365,7 @@ def test_load_skips_warmup_when_disabled(monkeypatch):
 def test_load_keeps_provider_ready_when_warmup_fails(monkeypatch):
     provider = LocalProvider(model_path="synthetic")
 
-    monkeypatch.setattr(local_mod, "load", lambda model_path: (FakeLoadedModel(), FakeLoadedTokenizer()))
-    monkeypatch.setattr(provider, "_init_batch_engine", lambda: None)
+    monkeypatch.setattr(provider._loader, "load", _fake_loader_load)
     monkeypatch.setattr(provider, "_run_warmup", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
 
     provider.load()
@@ -374,9 +378,12 @@ def test_load_falls_back_to_default_repo_when_default_local_dir_missing(monkeypa
     provider = LocalProvider(model_path=str(missing_default_dir))
     load_calls = []
 
-    monkeypatch.setattr(provider, "_find_cached_repo_snapshot", lambda repo_id: None)
-    monkeypatch.setattr(local_mod, "load", lambda model_path: (load_calls.append(model_path) or (FakeLoadedModel(), FakeLoadedTokenizer())))
-    monkeypatch.setattr(provider, "_init_batch_engine", lambda: None)
+    monkeypatch.setattr(provider._loader, "_find_cached_repo_snapshot", lambda repo_id: None)
+    monkeypatch.setattr(
+        mlx_loader_mod, "mlx_load",
+        lambda model_path: (load_calls.append(model_path) or (FakeLoadedModel(), FakeLoadedTokenizer())),
+    )
+    monkeypatch.setattr(provider._loader, "_init_batch_engine", lambda model, tokenizer: (None, None))
     monkeypatch.setattr(provider, "_run_warmup", lambda: None)
 
     provider.load()
@@ -390,8 +397,11 @@ def test_load_uses_existing_local_model_dir(monkeypatch, tmp_path):
     provider = LocalProvider(model_path=str(local_model_dir))
     load_calls = []
 
-    monkeypatch.setattr(local_mod, "load", lambda model_path: (load_calls.append(model_path) or (FakeLoadedModel(), FakeLoadedTokenizer())))
-    monkeypatch.setattr(provider, "_init_batch_engine", lambda: None)
+    monkeypatch.setattr(
+        mlx_loader_mod, "mlx_load",
+        lambda model_path: (load_calls.append(model_path) or (FakeLoadedModel(), FakeLoadedTokenizer())),
+    )
+    monkeypatch.setattr(provider._loader, "_init_batch_engine", lambda model, tokenizer: (None, None))
     monkeypatch.setattr(provider, "_run_warmup", lambda: None)
 
     provider.load()
@@ -404,9 +414,9 @@ def test_resolve_load_target_uses_cached_snapshot_when_default_dir_missing(monke
     provider = LocalProvider(model_path=str(missing_default_dir))
     cached_snapshot = str(tmp_path / "cache" / "snapshots" / "abc")
 
-    monkeypatch.setattr(provider, "_find_cached_repo_snapshot", lambda repo_id: cached_snapshot)
+    monkeypatch.setattr(provider._loader, "_find_cached_repo_snapshot", lambda repo_id: cached_snapshot)
 
-    assert provider._resolve_load_target() == cached_snapshot
+    assert provider._loader.resolve_target() == cached_snapshot
 
 
 def test_find_cached_repo_snapshot_prefers_latest(monkeypatch, tmp_path):
@@ -426,7 +436,7 @@ def test_find_cached_repo_snapshot_prefers_latest(monkeypatch, tmp_path):
     os.utime(new_snapshot, (new_ts, new_ts))
     monkeypatch.setenv("HUGGINGFACE_HUB_CACHE", str(hub_dir))
 
-    assert provider._find_cached_repo_snapshot(local_mod._DEFAULT_MODEL_REPO_ID) == str(new_snapshot)
+    assert provider._loader._find_cached_repo_snapshot(local_mod._DEFAULT_MODEL_REPO_ID) == str(new_snapshot)
 
 
 def test_system_prompt_cache_reuses_prefix_cache(monkeypatch):
@@ -633,6 +643,7 @@ def test_extract_generation_responses_keeps_non_tuple_payload():
 
 
 def test_render_prompt_disables_thinking_when_tokenizer_supports_flag():
+    from lumina.providers.mlx_prompt import MlxPromptBuilder
     provider = LocalProvider(model_path="synthetic")
 
     class FakeTokenizer:
@@ -650,6 +661,7 @@ def test_render_prompt_disables_thinking_when_tokenizer_supports_flag():
             return "prompt"
 
     provider._tokenizer = FakeTokenizer()
+    provider._prompt_builder = MlxPromptBuilder(provider._tokenizer)
 
     prompt = provider._render_prompt_text("sys", "user")
 
@@ -657,6 +669,7 @@ def test_render_prompt_disables_thinking_when_tokenizer_supports_flag():
 
 
 def test_render_prompt_falls_back_when_tokenizer_has_no_thinking_flag():
+    from lumina.providers.mlx_prompt import MlxPromptBuilder
     provider = LocalProvider(model_path="synthetic")
 
     class FakeTokenizer:
@@ -672,6 +685,7 @@ def test_render_prompt_falls_back_when_tokenizer_has_no_thinking_flag():
             return "prompt"
 
     provider._tokenizer = FakeTokenizer()
+    provider._prompt_builder = MlxPromptBuilder(provider._tokenizer)
 
     prompt = provider._render_prompt_text("sys", "user")
 

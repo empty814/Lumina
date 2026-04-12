@@ -5,11 +5,13 @@ LocalProvider：使用本地 mlx-lm 模型进行推理（默认 Provider）。
 架构分层（代码在类内按此顺序排列）
 ──────────────────────────────────────────────────────────────────────────────
 
-Layer 0 — 生命周期（load / _init_batch_engine / _maybe_run_warmup）
-  模型加载、BatchGenerator 初始化、warmup。外部只调用 load()。
+Layer 0 — 生命周期（load / _maybe_run_warmup）
+  委托给 MlxModelLoader（providers/mlx_loader.py）：路径解析、模型加载、
+  BatchGenerator 初始化。warmup 留在此处（依赖 Layer 1/2 能力）。
 
 Layer 1 — Prompt 构建（_build_prompt_tokens / _render_prompt_text）
-  tokenizer 编码，chat_template 渲染。
+  委托给 MlxPromptBuilder（providers/mlx_prompt.py）：tokenizer 编码，
+  chat_template 渲染。保留单行委托方法，保证测试 patch 和子类兼容。
 
 Layer 2 — System Prompt 缓存（_get_or_create_system_prompt_cache）
   委托给 SystemPromptCache（providers/system_prompt_cache.py）。
@@ -42,20 +44,16 @@ Continuous Batching 工作原理（_legacy_scheduler 路径）
   效果：TTFT(B) ≈ prefill(A) + 1 decode step，而非等 A 全部完成
 """
 import asyncio
-import inspect
 import logging
-import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, AsyncIterator, List, Optional
 import uuid
 
 try:
     import mlx.core as mx
-    from mlx_lm import load
-    from mlx_lm.generate import BatchGenerator, _left_pad_prompts, _make_cache, cache as mlx_cache
+    from mlx_lm.generate import _left_pad_prompts, _make_cache, cache as mlx_cache
     from mlx_lm.sample_utils import make_sampler
     _MLX_AVAILABLE = True
 except ImportError:
@@ -63,18 +61,17 @@ except ImportError:
 
 from lumina.engine.scheduler import GenerationRequest
 from .base import BaseProvider
+from .mlx_loader import MlxModelLoader, _DEFAULT_MODEL_REPO_ID  # noqa: F401 (re-export)
+from .mlx_prompt import MlxPromptBuilder
 from .system_prompt_cache import SystemPromptCache, SystemPromptCacheEntry
 
 # 每次迭代最多接入的新 prefill 请求数。
 # 取 4 可以更快吸收一小波同时到达的短请求，降低后到请求的排队 TTFT。
 _MAX_NEW_PREFILL_PER_ITER = 4
 _SYSTEM_PROMPT_CACHE_SIZE = 32
-_SYSTEM_PROMPT_SENTINEL = "<lumina_system_cache_user_probe_7a93d1e4>"
 _WARMUP_SYSTEM_PROMPT = "You are a helpful assistant."
 _WARMUP_USER_PROMPT = "Reply with one short word."
 _WARMUP_DECODE_STEPS = 4
-_DEFAULT_MODEL_REPO_ID = "mlx-community/Qwen3.5-0.8B-4bit"
-_DEFAULT_MODEL_DIRNAME = "qwen3.5-0.8b-4bit"
 
 logger = logging.getLogger("lumina")
 
@@ -135,99 +132,38 @@ class LocalProvider(BaseProvider):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._continuous_batch_ids: Optional[tuple] = None
         self._continuous_batch_cache: Optional[List[Any]] = None
-        self._batch_generator: Optional[BatchGenerator] = None
+        self._batch_generator = None
         self._batch_executor: Optional[ThreadPoolExecutor] = None
         self._legacy_executor: Optional[ThreadPoolExecutor] = None
         self._spc: Optional[SystemPromptCache] = None
-        self._supports_enable_thinking: Optional[bool] = None
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # Layer 0 — 生命周期
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _hf_hub_cache_dir(self) -> Path:
-        hub_cache = os.environ.get("HUGGINGFACE_HUB_CACHE")
-        if hub_cache:
-            return Path(hub_cache).expanduser()
-        hf_home = os.environ.get("HF_HOME")
-        if hf_home:
-            return Path(hf_home).expanduser() / "hub"
-        return Path.home() / ".cache" / "huggingface" / "hub"
-
-    def _find_cached_repo_snapshot(self, repo_id: str) -> Optional[str]:
-        repo_cache_dir = self._hf_hub_cache_dir() / f"models--{repo_id.replace('/', '--')}" / "snapshots"
-        if not repo_cache_dir.exists():
-            return None
-
-        candidates = [p for p in repo_cache_dir.iterdir() if p.is_dir()]
-        if not candidates:
-            return None
-
-        # 优先返回最近访问/修改的快照目录。
-        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        for snapshot_dir in candidates:
-            if any(snapshot_dir.glob("*.safetensors")):
-                return str(snapshot_dir)
-        return None
-
-    def _resolve_load_target(self) -> str:
-        raw_target = (self.model_path or "").strip()
-        if not raw_target:
-            cached = self._find_cached_repo_snapshot(_DEFAULT_MODEL_REPO_ID)
-            if cached:
-                logger.info("Use cached model snapshot: %s", cached)
-                return cached
-            return _DEFAULT_MODEL_REPO_ID
-
-        expanded = Path(raw_target).expanduser()
-        # 目录已存在：按本地模型目录加载。
-        if expanded.exists():
-            return str(expanded)
-
-        # 不存在的本地路径不能直接传给 mlx_lm.load（会被当作 repo id 并校验失败）。
-        is_path_like = (
-            expanded.is_absolute()
-            or raw_target.startswith(("~", ".", ".."))
-            or os.path.sep in raw_target
-            or (os.path.altsep and os.path.altsep in raw_target)
+        self._prompt_builder: Optional[MlxPromptBuilder] = None
+        self._loader = MlxModelLoader(
+            model_path=model_path,
+            max_new_prefill_per_iter=self.max_new_prefill_per_iter,
+            use_builtin_batch_engine_fn=self._use_builtin_batch_engine,
+            use_dedicated_batch_executor_fn=self._use_dedicated_batch_executor,
+            eos_ids_fn=lambda: self._eos_ids,
         )
-        if is_path_like and expanded.name.lower() == _DEFAULT_MODEL_DIRNAME:
-            cached = self._find_cached_repo_snapshot(_DEFAULT_MODEL_REPO_ID)
-            if cached:
-                logger.info(
-                    "Local model path missing, use cached snapshot: %s -> %s",
-                    expanded,
-                    cached,
-                )
-                return cached
-            logger.info(
-                "Local model path not found, fallback to repo id download: %s -> %s",
-                expanded,
-                _DEFAULT_MODEL_REPO_ID,
-            )
-            return _DEFAULT_MODEL_REPO_ID
 
-        return raw_target
+    # ══════════════════════════════════════════════════════════════════════════
+    # Layer 0 — 生命周期（委托给 MlxModelLoader，warmup 留在此处）
+    # ══════════════════════════════════════════════════════════════════════════
 
     def load(self):
-        load_target = self._resolve_load_target()
-        self._model, self._tokenizer = load(load_target)
-        mx.eval(self._model.parameters())
+        model, tokenizer, batch_generator, batch_executor = self._loader.load()
+        self._model = model
+        self._tokenizer = tokenizer
+        self._batch_generator = batch_generator
+        self._batch_executor = batch_executor
+        self._prompt_builder = MlxPromptBuilder(self._tokenizer)
         self._spc = SystemPromptCache(self._model, self._tokenizer)
-        self._init_batch_engine()
         self._maybe_run_warmup()
 
     def _init_batch_engine(self) -> None:
-        if self._use_builtin_batch_engine():
-            eos_ids = getattr(self._tokenizer, "eos_token_ids", None) or list(self._eos_ids)
-            self._batch_generator = BatchGenerator(
-                self._model,
-                stop_tokens=set(eos_ids),
-                prefill_batch_size=self.max_new_prefill_per_iter,
-                completion_batch_size=max(8, self.max_new_prefill_per_iter * 4),
-            )
-            if self._use_dedicated_batch_executor():
-                self._batch_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lumina-batch")
+        """重建 BatchGenerator / Executor（worker 重启时调用）。"""
+        bg, be = self._loader._init_batch_engine(self._model, self._tokenizer)
+        self._batch_generator = bg
+        self._batch_executor = be
 
     @property
     def is_ready(self) -> bool:
@@ -256,32 +192,15 @@ class LocalProvider(BaseProvider):
             self._worker_task = asyncio.create_task(worker())
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Layer 1 — Prompt 构建
+    # Layer 1 — Prompt 构建（委托给 MlxPromptBuilder）
+    # 单行委托方法保留：测试用 monkeypatch.setattr(provider, "_xxx") 和子类覆盖均依赖方法名。
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _build_prompt_tokens(self, system: str, user_text: str) -> mx.array:
-        prompt_str = self._render_prompt_text(system, user_text)
-        return mx.array(self._tokenizer.encode(prompt_str))
+    def _build_prompt_tokens(self, system: str, user_text: str):
+        return self._prompt_builder.encode(system, user_text)
 
     def _render_prompt_text(self, system: str, user_text: str) -> str:
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_text},
-        ]
-        kwargs = {
-            "tokenize": False,
-            "add_generation_prompt": True,
-        }
-        if self._supports_enable_thinking is None:
-            try:
-                sig = inspect.signature(self._tokenizer.apply_chat_template)
-                self._supports_enable_thinking = "enable_thinking" in sig.parameters
-            except (TypeError, ValueError):
-                self._supports_enable_thinking = False
-        if self._supports_enable_thinking:
-            kwargs["enable_thinking"] = False
-
-        return self._tokenizer.apply_chat_template(messages, **kwargs)
+        return self._prompt_builder.render(system, user_text)
 
     def _should_run_warmup(self) -> bool:
         return self.enable_warmup
@@ -345,38 +264,7 @@ class LocalProvider(BaseProvider):
 
     def _derive_system_prefix_tokens(self, system_text: str) -> Optional[List[int]]:
         """将 system_text 渲染为 prefix token ids（供 SystemPromptCache.render_fn 使用）。"""
-        prompt_text = self._render_prompt_text(system_text, _SYSTEM_PROMPT_SENTINEL)
-        sentinel_start = prompt_text.find(_SYSTEM_PROMPT_SENTINEL)
-        if sentinel_start < 0 or prompt_text.find(_SYSTEM_PROMPT_SENTINEL, sentinel_start + 1) != -1:
-            return None
-
-        base_tokenizer = getattr(self._tokenizer, "_tokenizer", self._tokenizer)
-        encoded = base_tokenizer(
-            prompt_text,
-            add_special_tokens=True,
-            return_offsets_mapping=True,
-        )
-        input_ids = encoded["input_ids"]
-        offsets = encoded["offset_mapping"]
-        sentinel_end = sentinel_start + len(_SYSTEM_PROMPT_SENTINEL)
-
-        sentinel_token_indices = []
-        for idx, (start, end) in enumerate(offsets):
-            if end <= sentinel_start or start >= sentinel_end:
-                continue
-            if start < sentinel_start or end > sentinel_end:
-                return None
-            sentinel_token_indices.append(idx)
-
-        if not sentinel_token_indices:
-            return None
-
-        sentinel_tokens = base_tokenizer.encode(_SYSTEM_PROMPT_SENTINEL, add_special_tokens=False)
-        span_tokens = input_ids[sentinel_token_indices[0] : sentinel_token_indices[-1] + 1]
-        if span_tokens != sentinel_tokens:
-            return None
-
-        return input_ids[: sentinel_token_indices[0]]
+        return self._prompt_builder.derive_prefix_tokens(system_text)
 
     def _get_or_create_system_prompt_cache(self, system_text: str) -> Optional[SystemPromptCacheEntry]:
         """委托给 SystemPromptCache，注入 render_fn（避免反向依赖）。"""
