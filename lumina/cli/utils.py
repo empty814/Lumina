@@ -7,6 +7,7 @@ lumina/cli/utils.py — 启动共用工具函数
 import json
 import logging
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -124,6 +125,43 @@ def sync_user_config() -> None:
         logger.info("Config sync: added %d new key(s): %s", len(new_keys), new_keys)
     except Exception as e:
         logger.warning("Config sync: failed to write user config: %s", e)
+
+
+def sync_static() -> None:
+    """
+    启动时将 bundle/源码内的 static 文件夹同步到 ~/.lumina/static/。
+    server.py 固定从 ~/.lumina/static/ serve，保证命令行和 .app 两种
+    启动方式都使用同一份最新文件，无需手动 cp。
+    """
+    import sys as _sys
+    # 确定 bundle 内的 source 目录
+    if hasattr(_sys, "_MEIPASS"):
+        src = Path(_sys._MEIPASS) / "lumina" / "api" / "static"
+    else:
+        src = Path(__file__).parent.parent / "api" / "static"
+
+    if not src.is_dir():
+        logger.warning("sync_static: source dir not found: %s", src)
+        return
+
+    dest = Path.home() / ".lumina" / "static"
+    dest.mkdir(parents=True, exist_ok=True)
+
+    updated = []
+    for src_file in src.iterdir():
+        if not src_file.is_file():
+            continue
+        dst_file = dest / src_file.name
+        # 只在内容变化时覆盖（比较文件大小+mtime，避免无谓 IO）
+        if dst_file.exists():
+            ss, ds = src_file.stat(), dst_file.stat()
+            if ss.st_size == ds.st_size and ss.st_mtime <= ds.st_mtime:
+                continue
+        shutil.copy2(str(src_file), str(dst_file))
+        updated.append(src_file.name)
+
+    if updated:
+        logger.info("sync_static: updated %s", updated)
 
 
 def resolve_config_path() -> str | None:

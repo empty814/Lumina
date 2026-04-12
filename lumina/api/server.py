@@ -27,11 +27,19 @@ except Exception:
     _LUMINA_VERSION = "0.3.0"
 
 # ── 静态文件路径 ───────────────────────────────────────────────────────────────
-_STATIC_DIR = (
+_BUNDLE_STATIC = (
     Path(_sys._MEIPASS) / "lumina" / "api" / "static"
     if hasattr(_sys, "_MEIPASS")
     else Path(__file__).parent / "static"
 )
+
+
+def _static_dir() -> Path:
+    """优先使用 ~/.lumina/static/（由 sync_static() 在启动时同步），
+    fallback 到 bundle/源码内路径。动态求值，避免模块 import 时目录尚未创建。
+    """
+    p = Path.home() / ".lumina" / "static"
+    return p if p.is_dir() else _BUNDLE_STATIC
 
 
 @asynccontextmanager
@@ -91,11 +99,11 @@ def create_app(llm: LLMEngine, transcriber: Transcriber, lifespan=None) -> FastA
 
     @app.get("/")
     async def pwa_index():
-        return FileResponse(_STATIC_DIR / "index.html", media_type="text/html")
+        return FileResponse(_static_dir() / "index.html", media_type="text/html")
 
     @app.get("/logo.svg")
     async def pwa_logo():
-        return FileResponse(_STATIC_DIR / "logo.svg", media_type="image/svg+xml")
+        return FileResponse(_static_dir() / "logo.svg", media_type="image/svg+xml")
 
     @app.get("/manifest.json")
     async def pwa_manifest():

@@ -508,6 +508,8 @@ def cmd_server(args):
         os.environ["LUMINA_LOG_LEVEL"] = args.log_level
 
     sync_user_config()
+    from lumina.cli.utils import sync_static
+    sync_static()
     config_path = getattr(args, "config", None) or resolve_config_path()
     cfg = get_config(config_path)
     setup_logging(cfg.log_level)
