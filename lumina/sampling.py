@@ -36,9 +36,8 @@ def build_mlx_sampler(
         make_sampler,
     )
 
-    # 调试阶段强制走贪心采样，忽略上传入的 temperature。
     base_sampler = make_sampler(
-        temp=0.0,
+        temp=temperature,
         top_p=top_p,
         min_p=min_p,
         top_k=top_k,

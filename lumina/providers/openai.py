@@ -55,7 +55,6 @@ class OpenAIProvider(BaseProvider):
         presence_penalty: float = DEFAULT_PRESENCE_PENALTY,
         repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
     ) -> dict:
-        effective_temperature = 0.0
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -64,7 +63,7 @@ class OpenAIProvider(BaseProvider):
             "model": self.model,
             "messages": messages,
             "max_tokens": max_tokens,
-            "temperature": effective_temperature,
+            "temperature": temperature,
             "top_p": top_p,
             "top_k": top_k,
             "min_p": min_p,

@@ -686,7 +686,6 @@ class LocalProvider(BaseProvider):
             raise RuntimeError("LocalProvider not loaded. Call load() first.")
 
         self._ensure_worker()
-        effective_temperature = 0.0
 
         system_str = system if system is not None else "You are a helpful assistant."
         prompt_tokens = self._build_prompt_tokens(system_str, user_text)
@@ -695,7 +694,7 @@ class LocalProvider(BaseProvider):
             request_id=uuid.uuid4().hex,
             prompt_tokens=prompt_tokens,
             max_tokens=max_tokens,
-            temperature=effective_temperature,
+            temperature=temperature,
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,

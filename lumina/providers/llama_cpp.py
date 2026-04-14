@@ -67,12 +67,11 @@ class LlamaCppProvider(BaseProvider):
         messages.append({"role": "user", "content": user_text})
 
         def _run():
-            effective_temperature = 0.0
             try:
                 for chunk in self._llm.create_chat_completion(  # type: ignore[union-attr]
                     messages=messages,
                     max_tokens=max_tokens,
-                    temperature=effective_temperature,
+                    temperature=temperature,
                     top_p=top_p,
                     stream=True,
                 ):
