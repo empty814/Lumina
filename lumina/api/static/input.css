@@ -45,17 +45,32 @@
 
 /* 默认隐藏所有的 panel */
 #panel-digest,
-#panel-translate,
-#panel-summarize,
+#panel-document,
+#panel-image,
 #panel-settings {
   display: none;
 }
 
 /* CSS Tab 切换逻辑 */
 #tab-digest:checked ~ main #panel-digest { display: grid; }
-#tab-translate:checked ~ main #panel-translate { display: grid; }
-#tab-summarize:checked ~ main #panel-summarize { display: grid; }
+#tab-document:checked ~ main #panel-document { display: grid; }
+#tab-image:checked ~ main #panel-image { display: grid; }
 #tab-settings:checked ~ main #panel-settings { display: block; }
+
+/* 导航栏高亮 */
+#tab-digest:checked ~ nav label[data-tab="digest"],
+#tab-document:checked ~ nav label[data-tab="document"],
+#tab-image:checked ~ nav label[data-tab="image"],
+#tab-settings:checked ~ nav label[data-tab="settings"] {
+  @apply nav-active;
+}
+
+#tab-digest:not(:checked) ~ nav label[data-tab="digest"],
+#tab-document:not(:checked) ~ nav label[data-tab="document"],
+#tab-image:not(:checked) ~ nav label[data-tab="image"],
+#tab-settings:not(:checked) ~ nav label[data-tab="settings"] {
+  @apply text-zinc-400 hover:text-zinc-900 dark:hover:text-white;
+}
 
 /* 旧版需要通过 radio 控制的 save-bar，在设置里也有体现 */
 #save-bar { display: none; }
@@ -72,39 +87,52 @@
 .htmx-request.htmx-indicator { display: block; }
 
 /* Modal 覆盖等 */
-.modal-overlay {
+.modal-overlay,
+.pdf-route-sheet {
   position: fixed; inset: 0; z-index: 8000;
   background: rgba(0,0,0,0.42); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
-  display: flex; align-items: flex-end;
+  display: flex; align-items: flex-end; justify-content: center;
   opacity: 0; pointer-events: none; transition: opacity .25s ease;
 }
-.modal-overlay.open { opacity: 1; pointer-events: auto; }
-.modal-sheet {
-  width: 100%; max-height: 88vh; background: #ffffff;
-  border-radius: 24px 24px 0 0; display: flex; flex-direction: column;
+.pdf-route-sheet { z-index: 8500; }
+.modal-overlay.open,
+.pdf-route-sheet.open { opacity: 1; pointer-events: auto; }
+
+.modal-sheet,
+.pdf-route-box {
+  width: 100%; display: flex; flex-direction: column;
   transform: translateY(100%); transition: transform .3s cubic-bezier(.32,.72,0,1); overflow: hidden;
+  @apply glass rounded-t-[2rem];
 }
-.dark .modal-sheet { background: #2c2c2e; }
-.modal-overlay.open .modal-sheet { transform: translateY(0); }
-.modal-sheet.fullscreen { max-height:100vh; border-radius:0; }
+
+.modal-sheet { max-height: 88vh; }
+.pdf-route-box { padding: 20px 20px 36px; gap: 10px; }
+
+.modal-overlay.open .modal-sheet,
+.pdf-route-sheet.open .pdf-route-box { transform: translateY(0); }
+
+/* 桌面端居中显示 */
+@media (min-width: 768px) {
+  .modal-overlay,
+  .pdf-route-sheet {
+    align-items: center;
+    padding: 2rem;
+  }
+  .modal-sheet,
+  .pdf-route-box {
+    width: 100%; max-width: 800px;
+    transform: scale(0.95); opacity: 0; transition: all .3s cubic-bezier(.32,.72,0,1);
+    @apply rounded-[2rem] shadow-2xl;
+  }
+  .pdf-route-box { max-width: 480px; padding: 24px; }
+  .modal-overlay.open .modal-sheet,
+  .pdf-route-sheet.open .pdf-route-box { transform: scale(1); opacity: 1; }
+  .modal-handle { display: none; }
+}
+
+.modal-sheet.fullscreen { max-height: 100vh; max-width: 100%; border-radius: 0; transform: scale(1) translateY(0); margin: 0; padding: 0; }
 
 .modal-handle { width: 36px; height: 5px; background: rgba(60,60,67,.12); border-radius: 3px; margin: 10px auto 0; flex-shrink: 0; }
 .dark .modal-handle { background: rgba(84,84,88,.55); }
-.modal-header { display: flex; align-items: center; justify-content: space-between; padding: 12px 20px 10px; border-bottom: 1px solid rgba(60,60,67,.12); flex-shrink: 0; }
-.dark .modal-header { border-bottom: 1px solid rgba(84,84,88,.55); }
-
-/* Document PDF Route Modal */
-.pdf-route-sheet {
-  position:fixed; inset:0; z-index:8500;
-  background:rgba(0,0,0,.42); backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px);
-  display:flex; align-items:flex-end;
-  opacity:0; pointer-events:none; transition:opacity .2s;
-}
-.pdf-route-sheet.open { opacity:1; pointer-events:auto; }
-.pdf-route-box {
-  width:100%; background:#ffffff; border-radius:24px 24px 0 0;
-  padding:20px 20px 36px; display:flex; flex-direction:column; gap:10px;
-  transform:translateY(100%); transition:transform .28s cubic-bezier(.32,.72,0,1);
-}
-.dark .pdf-route-box { background:#2c2c2e; }
-.pdf-route-sheet.open .pdf-route-box { transform:translateY(0); }
+.modal-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 24px 12px; border-bottom: 1px solid rgba(0,0,0,.08); flex-shrink: 0; }
+.dark .modal-header { border-bottom: 1px solid rgba(255,255,255,.08); }

@@ -25,9 +25,22 @@ def random_uuid() -> str:
 
 # ── Chat Completions ──────────────────────────────────────────────────────────
 
-class MessageContent(BaseModel):
+class TextMessageContent(BaseModel):
     type: Literal["text"] = "text"
     text: str
+
+
+class ImageUrlPayload(BaseModel):
+    url: str
+    detail: Optional[Literal["auto", "low", "high"]] = None
+
+
+class ImageUrlMessageContent(BaseModel):
+    type: Literal["image_url"] = "image_url"
+    image_url: ImageUrlPayload
+
+
+MessageContent = Union[TextMessageContent, ImageUrlMessageContent]
 
 
 class ChatMessage(BaseModel):
@@ -123,6 +136,61 @@ class PolishRequest(BaseModel):
 class PdfUrlRequest(BaseModel):
     url: str
     lang_out: str = "zh"
+
+
+class ImageUrlRequest(BaseModel):
+    url: str
+
+
+class MediaTextResponse(BaseModel):
+    text: str
+    model: str
+
+
+# ── 批处理接口 ────────────────────────────────────────────────────────────────
+
+class BatchDocumentRequest(BaseModel):
+    input_dir: str
+    output_dir: Optional[str] = None
+    task: Literal["translate", "summarize"] = "summarize"
+    target_language: Literal["zh", "en"] = "zh"
+
+
+class BatchImageRequest(BaseModel):
+    input_dir: str
+    output_dir: Optional[str] = None
+    task: Literal["image_ocr", "image_caption"] = "image_ocr"
+
+
+class BatchItemStatus(BaseModel):
+    path: str
+    rel_path: str
+    status: Literal["pending", "running", "done", "error"] = "pending"
+    output_paths: List[str] = Field(default_factory=list)
+    preview: Optional[str] = None
+    error: Optional[str] = None
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+
+
+class BatchJobResponse(BaseModel):
+    job_id: str
+    kind: Literal["document", "image"]
+    task: str
+    status: Literal["queued", "running", "done", "error"] = "queued"
+    input_dir: str
+    output_dir: str
+    total: int
+    completed: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    current_item: Optional[str] = None
+    items: List[BatchItemStatus] = Field(default_factory=list)
+    created_at: float = Field(default_factory=time.time)
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+    target_language: Optional[str] = None
+    error: Optional[str] = None
 
 
 # ── 录音控制 ──────────────────────────────────────────────────────────────────

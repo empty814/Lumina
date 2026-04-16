@@ -71,13 +71,18 @@ def create_app(llm: LLMEngine, transcriber: Transcriber, lifespan=None) -> FastA
                     cli/server.py 传入包含 uvicorn loop 捕获逻辑的 closure。
     """
     from lumina.services.pdf import PdfJobManager
+    from lumina.batch import BatchJobManager
     from lumina.api.routers import pdf as pdf_router
+    from lumina.api.routers import batch as batch_router
     from lumina.api.routers import chat as chat_router
     from lumina.api.routers import config as config_router
     from lumina.api.routers import digest as digest_router
     from lumina.api.routers import audio as audio_router
+    from lumina.api.routers import media as media_router
     from lumina.api.routers import text as text_router
     from lumina.api.routers import fragments as fragments_router
+    from lumina.config import get_config
+    from lumina.ui_meta import HOME_TAB_DEFS, IMAGE_TASK_DEFS, LEGACY_HOME_TAB_MAP
 
     _lifespan = lifespan if lifespan is not None else _default_lifespan
     app = FastAPI(title="Lumina", version=_LUMINA_VERSION, lifespan=_lifespan)
@@ -86,6 +91,8 @@ def create_app(llm: LLMEngine, transcriber: Transcriber, lifespan=None) -> FastA
     app.state.llm = llm
     app.state.transcriber = transcriber
     app.state.pdf_manager = PdfJobManager()
+    app.state.batch_manager = BatchJobManager(llm)
+    app.state.digest_scheduler = None
     app.state.server_start_time = time.time()  # lifespan 会用精确值覆盖
 
     app.add_middleware(
@@ -97,10 +104,12 @@ def create_app(llm: LLMEngine, transcriber: Transcriber, lifespan=None) -> FastA
 
     # 注册路由（不再调用 init_router）
     app.include_router(pdf_router.router)
+    app.include_router(batch_router.router)
     app.include_router(chat_router.router)
     app.include_router(config_router.router)
     app.include_router(digest_router.router)
     app.include_router(audio_router.router)
+    app.include_router(media_router.router)
     app.include_router(text_router.router)
     app.include_router(fragments_router.router)
 
@@ -113,18 +122,53 @@ def create_app(llm: LLMEngine, transcriber: Transcriber, lifespan=None) -> FastA
 
     @app.get("/")
     async def pwa_index(request: Request):
-        css_path = _static_dir() / "style.css"
-        css_ver = int(css_path.stat().st_mtime) if css_path.exists() else 0
+        static_root = _static_dir()
+        asset_ver = 0
+        if static_root.exists():
+            asset_ver = max(
+                (int(path.stat().st_mtime) for path in static_root.rglob("*") if path.is_file()),
+                default=0,
+            )
 
-        import getpass
-        try:
-            username = getpass.getuser().capitalize()
-        except Exception:
-            username = ""
+        cfg = get_config()
+        configured_username = ""
+        if isinstance(getattr(cfg, "branding", None), dict):
+            configured_username = str(cfg.branding.get("username", "") or "").strip()
+        if configured_username:
+            username = configured_username
+        else:
+            import getpass
+
+            try:
+                username = getpass.getuser().capitalize()
+            except Exception:
+                username = ""
+
+        slogan_candidates = cfg.branding.get("slogans", [])
+        home_ui = {
+            "enabled_tabs": cfg.ui.home.enabled_tabs,
+            "image_enabled": cfg.ui.home.image_enabled,
+            "image_modules": cfg.ui.home.image_modules,
+            "allow_local_override": cfg.ui.home.allow_local_override,
+        }
+        image_prompts = {
+            "image_ocr": cfg.system_prompts.get("image_ocr", ""),
+            "image_caption": cfg.system_prompts.get("image_caption", ""),
+        }
 
         return _tmpl.TemplateResponse(
             "index.html",
-            {"request": request, "css_ver": css_ver, "username": username},
+            {
+                "request": request,
+                "asset_ver": asset_ver,
+                "username": username,
+                "slogan_candidates": slogan_candidates,
+                "home_ui": home_ui,
+                "image_prompts": image_prompts,
+                "home_tab_defs": HOME_TAB_DEFS,
+                "image_task_defs": IMAGE_TASK_DEFS,
+                "legacy_home_tab_map": LEGACY_HOME_TAB_MAP,
+            },
             headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
         )
 

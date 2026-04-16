@@ -13,7 +13,7 @@ import hashlib
 import time
 import uuid
 from datetime import datetime
-from typing import AsyncIterator, Dict, Optional
+from typing import Any, AsyncIterator, Dict, Optional
 
 from lumina.providers.base import BaseProvider
 from lumina.request_context import get_request_context
@@ -33,6 +33,10 @@ class LLMEngine:
     @property
     def is_loaded(self) -> bool:
         return self._provider.is_ready
+
+    @property
+    def provider_capabilities(self):
+        return self._provider.capabilities
 
     def _resolve_system(self, task: str, system_override: Optional[str]) -> Optional[str]:
         """
@@ -139,6 +143,42 @@ class LLMEngine:
             presence_penalty=presence_penalty,
             repetition_penalty=repetition_penalty,
         )
+
+    @staticmethod
+    def _messages_to_history_text(messages: list[dict[str, Any]]) -> str:
+        chunks: list[str] = []
+        for msg in messages:
+            role = str(msg.get("role", "user"))
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                chunks.append(f"{role}: {content}")
+                continue
+            if not isinstance(content, list):
+                continue
+            parts: list[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type")
+                if item_type == "text":
+                    text = str(item.get("text", "")).strip()
+                    if text:
+                        parts.append(text)
+                elif item_type == "image_url":
+                    payload = item.get("image_url") or {}
+                    url = str(payload.get("url", ""))
+                    if url.startswith("data:"):
+                        parts.append("[image:data-url omitted]")
+                    elif url:
+                        parts.append(f"[image:{url}]")
+                    else:
+                        parts.append("[image]")
+            chunks.append(f"{role}: {' '.join(parts).strip()}")
+        return "\n\n".join(chunk for chunk in chunks if chunk.strip()).strip()
+
+    @property
+    def provider_model_name(self) -> str:
+        return self._provider_model() or "lumina"
 
     async def generate_stream(
         self,
@@ -250,6 +290,127 @@ class LLMEngine:
                 stream=False,
                 system_prompt=system_prompt,
                 user_text=user_text,
+                response_text=response_text,
+                status=status,
+                started_at=started_at,
+                duration_ms=int((time.perf_counter() - started_perf) * 1000),
+                error=error,
+            )
+            entry.update(params)
+            request_history.record(entry)
+
+    async def generate_messages_stream(
+        self,
+        messages: list[dict[str, Any]],
+        task: str = "chat",
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        system: Optional[str] = None,
+        *,
+        top_k: Optional[int] = None,
+        min_p: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
+        repetition_penalty: Optional[float] = None,
+    ) -> AsyncIterator[str]:
+        system_prompt = self._resolve_system(task, system)
+        params = self._resolve_sampling(max_tokens, temperature, top_p, top_k, min_p, presence_penalty, repetition_penalty)
+        started_at = datetime.now()
+        started_perf = time.perf_counter()
+        request_id = get_request_context().get("request_id") or uuid.uuid4().hex
+        chunks = []
+        status = "ok"
+        error = None
+        history_text = self._messages_to_history_text(messages)
+        try:
+            async for token in self._provider.generate_messages_stream(
+                messages=messages,
+                system=system_prompt,
+                max_tokens=params["max_tokens"],
+                temperature=params["temperature"],
+                top_p=params["top_p"],
+                top_k=params["top_k"],
+                min_p=params["min_p"],
+                presence_penalty=params["presence_penalty"],
+                repetition_penalty=params["repetition_penalty"],
+            ):
+                chunks.append(token)
+                yield token
+        except asyncio.CancelledError as e:
+            status = "cancelled"
+            error = e
+            raise
+        except Exception as e:
+            status = "error"
+            error = e
+            raise
+        finally:
+            entry = self._history_entry(
+                request_id=request_id,
+                task=task,
+                stream=True,
+                system_prompt=system_prompt,
+                user_text=history_text,
+                response_text="".join(chunks),
+                status=status,
+                started_at=started_at,
+                duration_ms=int((time.perf_counter() - started_perf) * 1000),
+                error=error,
+            )
+            entry.update(params)
+            request_history.record(entry)
+
+    async def generate_messages(
+        self,
+        messages: list[dict[str, Any]],
+        task: str = "chat",
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        system: Optional[str] = None,
+        *,
+        top_k: Optional[int] = None,
+        min_p: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
+        repetition_penalty: Optional[float] = None,
+    ) -> str:
+        system_prompt = self._resolve_system(task, system)
+        params = self._resolve_sampling(max_tokens, temperature, top_p, top_k, min_p, presence_penalty, repetition_penalty)
+        started_at = datetime.now()
+        started_perf = time.perf_counter()
+        request_id = get_request_context().get("request_id") or uuid.uuid4().hex
+        status = "ok"
+        error = None
+        response_text = ""
+        history_text = self._messages_to_history_text(messages)
+        try:
+            response_text = await self._provider.generate_messages(
+                messages=messages,
+                system=system_prompt,
+                max_tokens=params["max_tokens"],
+                temperature=params["temperature"],
+                top_p=params["top_p"],
+                top_k=params["top_k"],
+                min_p=params["min_p"],
+                presence_penalty=params["presence_penalty"],
+                repetition_penalty=params["repetition_penalty"],
+            )
+            return response_text
+        except asyncio.CancelledError as e:
+            status = "cancelled"
+            error = e
+            raise
+        except Exception as e:
+            status = "error"
+            error = e
+            raise
+        finally:
+            entry = self._history_entry(
+                request_id=request_id,
+                task=task,
+                stream=False,
+                system_prompt=system_prompt,
+                user_text=history_text,
                 response_text=response_text,
                 status=status,
                 started_at=started_at,

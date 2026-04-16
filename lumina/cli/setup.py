@@ -8,21 +8,19 @@ import json
 import logging
 import os
 import sys
-from pathlib import Path
 
+from lumina.config_runtime import PACKAGE_CONFIG_PATH, read_mutable_config_data, writable_config_path, write_config_atomic
 from lumina.platform_support.runtime import get_local_model_download_spec
 
 logger = logging.getLogger("lumina")
 
 _EDITION = os.environ.get("LUMINA_EDITION")
-_USER_CONFIG_PATH = Path.home() / ".lumina" / "config.json"
 
 
 def _provider_type_from_config() -> str:
     """从 config.json 读取 provider.type，读取失败时返回 'local'。"""
     try:
-        with open(_USER_CONFIG_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = read_mutable_config_data()
         return data.get("provider", {}).get("type", "local")
     except Exception:
         return "local"
@@ -104,10 +102,10 @@ def needs_lite_setup() -> bool:
     """Lite 版且尚未完成过配置向导。"""
     if _EDITION != "lite":
         return False
-    if _USER_CONFIG_PATH.exists():
+    target = writable_config_path()
+    if target.exists():
         try:
-            with open(_USER_CONFIG_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            data = read_mutable_config_data()
             return not data.get("provider", {}).get("openai", {}).get("base_url", "")
         except Exception:
             return True
@@ -136,8 +134,7 @@ def lite_setup_wizard():
     port_str = input("本机监听端口（留空则使用默认值 31821）: ").strip()
     port = int(port_str) if port_str.isdigit() else 31821
 
-    _pkg_dir = Path(__file__).parent.parent
-    with open(_pkg_dir / "config.json", "r", encoding="utf-8") as f:
+    with open(PACKAGE_CONFIG_PATH, "r", encoding="utf-8") as f:
         cfg_data = json.load(f)
 
     cfg_data["provider"]["openai"]["base_url"] = base_url
@@ -145,10 +142,8 @@ def lite_setup_wizard():
     cfg_data["provider"]["openai"]["model"]    = model
     cfg_data["port"] = port
 
-    _USER_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(_USER_CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg_data, f, indent=2, ensure_ascii=False)
+    target = write_config_atomic(cfg_data)
 
     print()
-    print(f"✓ 配置已保存至 {_USER_CONFIG_PATH}")
+    print(f"✓ 配置已保存至 {target}")
     print()

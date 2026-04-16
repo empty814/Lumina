@@ -42,7 +42,7 @@ async def refresh_digest_api(background_tasks: BackgroundTasks, raw: Request):
         await maybe_generate_digest(llm, force_full=True)
 
     background_tasks.add_task(_run)
-    return HTMLResponse('<span style="color:var(--accent);">⏳ 已触发，稍后自动刷新…</span>')
+    return HTMLResponse('<span class="text-indigo-500 font-bold text-sm">⏳ 已触发，稍后自动刷新…</span>')
 
 
 @router.get("/debug")

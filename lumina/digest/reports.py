@@ -90,6 +90,20 @@ def list_report_keys(report_type: str) -> List[str]:
     return sorted([f.stem for f in d.glob("*.md")], reverse=True)
 
 
+def list_snapshot_dates() -> List[date]:
+    """返回已有快照覆盖到的日期列表，升序。"""
+    if not DIGEST_SNAPSHOTS_DIR.exists():
+        return []
+    seen = set()
+    for path in DIGEST_SNAPSHOTS_DIR.glob("*.md"):
+        day_text = path.stem.split("T", 1)[0]
+        try:
+            seen.add(date.fromisoformat(day_text))
+        except ValueError:
+            logger.debug("Digest: skip malformed snapshot filename %s", path.name)
+    return sorted(seen)
+
+
 # ── 日期 key 工具 ─────────────────────────────────────────────────────────────
 
 def daily_key(d: Optional[date] = None) -> str:
@@ -117,6 +131,62 @@ def adjacent_keys(report_type: str, key: str) -> Tuple[Optional[str], Optional[s
     prev_key = keys[idx + 1] if idx + 1 < len(keys) else None
     next_key = keys[idx - 1] if idx > 0 else None
     return prev_key, next_key
+
+
+def _existing_daily_report_dates() -> List[date]:
+    dates = []
+    for key in list_report_keys("daily"):
+        try:
+            dates.append(date.fromisoformat(key))
+        except ValueError:
+            logger.debug("Digest: skip malformed daily report key %s", key)
+    return sorted(set(dates))
+
+
+def find_missing_daily_report_keys(
+    now: Optional[datetime] = None,
+    notify_time: str = "20:00",
+) -> List[str]:
+    """根据快照找缺失日报，只补已经到达生成时机的日期。"""
+    now = now or datetime.now()
+    today = now.date()
+    try:
+        notify_hour, notify_minute = map(int, notify_time.split(":"))
+    except Exception:
+        notify_hour, notify_minute = 20, 0
+    notify_passed = (now.hour, now.minute) >= (notify_hour, notify_minute)
+    existing = set(list_report_keys("daily"))
+
+    missing = []
+    for d in list_snapshot_dates():
+        if d > today:
+            continue
+        if d == today and not notify_passed:
+            continue
+        key = daily_key(d)
+        if key not in existing:
+            missing.append(key)
+    return missing
+
+
+def find_missing_weekly_report_keys(today: Optional[date] = None) -> List[str]:
+    """根据已有日报找缺失周报，跳过当前仍在进行中的这一周。"""
+    today = today or date.today()
+    current_week = weekly_key(today)
+    existing = set(list_report_keys("weekly"))
+    week_keys = sorted({weekly_key(d) for d in _existing_daily_report_dates() if weekly_key(d) != current_week})
+    return [wk for wk in week_keys if wk not in existing]
+
+
+def find_missing_monthly_report_keys(today: Optional[date] = None) -> List[str]:
+    """根据已有日报找缺失月报，跳过当前仍在进行中的这个月。"""
+    today = today or date.today()
+    current_month = monthly_key(today)
+    existing = set(list_report_keys("monthly"))
+    month_keys = sorted(
+        {monthly_key(d) for d in _existing_daily_report_dates() if monthly_key(d) != current_month}
+    )
+    return [mk for mk in month_keys if mk not in existing]
 
 
 # ── 输入文本构建 ──────────────────────────────────────────────────────────────

@@ -86,6 +86,51 @@ class TestBasicLoad:
         cfg = Config(_write_config(tmp_path, data))
         assert cfg.system_prompts["chat"] == "You are helpful."
 
+    def test_branding_slogans_loaded(self, tmp_path):
+        data = {
+            **_base_config(),
+            "branding": {"slogans": ["让 AI 留在本地", "你的本地 AI 工作台"]},
+        }
+        cfg = Config(_write_config(tmp_path, data))
+        assert cfg.branding["slogans"] == ["让 AI 留在本地", "你的本地 AI 工作台"]
+
+    def test_branding_username_loaded_and_trimmed(self, tmp_path):
+        data = {
+            **_base_config(),
+            "branding": {"username": "  Lumina 用户  "},
+        }
+        cfg = Config(_write_config(tmp_path, data))
+        assert cfg.branding["username"] == "Lumina 用户"
+
+    def test_ui_home_loaded(self, tmp_path):
+        data = {
+            **_base_config(),
+            "ui": {
+                "home": {
+                    "enabled_tabs": ["digest", "document", "image", "settings"],
+                    "image_enabled": True,
+                    "image_modules": ["image_ocr"],
+                    "allow_local_override": False,
+                }
+            },
+        }
+        cfg = Config(_write_config(tmp_path, data))
+        assert cfg.ui.home.enabled_tabs == ["digest", "document", "image", "settings"]
+        assert cfg.ui.home.image_modules == ["image_ocr"]
+        assert cfg.ui.home.allow_local_override is False
+
+    def test_ui_home_legacy_tabs_migrated(self, tmp_path):
+        data = {
+            **_base_config(),
+            "ui": {
+                "home": {
+                    "enabled_tabs": ["digest", "translate", "summarize", "lab", "settings"],
+                }
+            },
+        }
+        cfg = Config(_write_config(tmp_path, data))
+        assert cfg.ui.home.enabled_tabs == ["digest", "document", "image", "settings"]
+
 
 # ── SamplingConfig 解析 ───────────────────────────────────────────────────────
 

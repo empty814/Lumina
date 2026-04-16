@@ -44,8 +44,10 @@
 
 步骤：
 1. 打开首页
-2. 测试翻译、总结、润色各一次
-3. 请求：
+2. 确认首页能看到 `回顾 / 文档 / 图像 / 设置` 入口
+3. 测试翻译、总结、润色各一次
+4. 测试图像 OCR / Caption 各一次
+5. 请求：
    - `GET /health`
    - `GET /v1/config`
    - `GET /v1/models`
@@ -54,6 +56,12 @@
 - 页面正常渲染
 - API 无 500
 - `/v1/config` 中的 `provider.backend` 与平台一致
+- `文档` 入口支持文本 / 文件 / 链接三种输入
+- `图像` 入口支持 URL 与文件两种输入
+
+建议补测：
+- `PATCH /v1/config` 修改 `digest.notify_time` 或 `ui.home.enabled_tabs` 后，刷新页面能看到变化
+- 如果当前 `provider.type=local` 使用的是支持视觉输入的模型，图像任务应直接走本地多模态链路
 
 ## 验收 3：PDF 翻译 / 总结
 
@@ -150,6 +158,8 @@ Linux 特别关注：
 - Windows / Linux 能看到 Chromium 系浏览器历史
 - Windows / Linux 能看到 Cursor 对话记录
 - Apple 专属源缺失时是合理降级，不会报错
+- 修改 `refresh_hours` / `notify_time` 后无需重启整个服务即可生效新的调度时间
+- 如果中间多天未登录，重新启动服务后会补齐缺失的日报 / 周报 / 月报
 
 ## 验收 9：桌面入口体验
 

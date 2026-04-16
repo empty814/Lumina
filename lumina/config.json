@@ -67,6 +67,10 @@
     "hotkey": "cmd",
     "language": "zh"
   },
+  "desktop": {
+    "_readme": "桌面端行为配置。menubar_enabled 控制 macOS 菜单栏图标默认是否显示；可通过命令行或菜单栏动作切换。",
+    "menubar_enabled": true
+  },
   "request_history": {
     "_readme": "LLM 请求历史记录。默认保存完整 prompt/response 正文用于 debug；历史按天滚动、压缩并自动清理",
     "enabled": true,
@@ -76,13 +80,49 @@
     "compress_after_days": 1,
     "cleanup_on_startup": true
   },
+  "branding": {
+    "_readme": "前端品牌文案配置。username 可选，用于首页欢迎语里显示自定义用户名；留空时自动获取当前系统用户名。slogans 用于首页副标题候选，前端会在每次新访问时随机选一句，并在当前会话内保持不变。",
+    "username": "",
+    "slogans": [
+      "让 AI 留在本地",
+      "在你的电脑上思考",
+      "你的本地 AI 工作台",
+      "把智能留给自己",
+      "本地运行，安心使用"
+    ]
+  },
+  "ui": {
+    "_readme": "前端界面配置。home.enabled_tabs 控制首页默认显示哪些一级入口；浏览器端仍可按本地偏好覆盖。document 为统一的文档工作台入口。image_modules 控制图片功能开放的模块。",
+    "home": {
+      "enabled_tabs": [
+        "digest",
+        "document",
+        "image",
+        "settings"
+      ],
+      "image_enabled": true,
+      "image_modules": [
+        "image_ocr",
+        "image_caption"
+      ],
+      "allow_local_override": true
+    }
+  },
+  "media": {
+    "_readme": "图片能力配置。OCR / Caption 走主 LLM provider，并分别使用 image_ocr / image_caption 的 system prompt。max_image_mb 控制上传大小。",
+    "ocr_model": "microsoft/trocr-base-printed",
+    "caption_model": "Salesforce/blip-image-captioning-base",
+    "max_image_mb": 12
+  },
   "system_prompts": {
-    "_readme": "各任务的 system prompt，修改后重启生效。digest/daily_report/weekly_report/monthly_report 控制日报相关生成；asr_zh/asr_en 为语音转写的 initial_prompt。",
+    "_readme": "各任务的 system prompt，修改后重启生效。digest/daily_report/weekly_report/monthly_report 控制日报相关生成；image_ocr/image_caption 控制图像任务；asr_zh/asr_en 为语音转写的 initial_prompt。",
     "translate_to_zh": "You are a professional translator. Translate the user's text into Simplified Chinese. Output only the translated text, no explanations.",
     "translate_to_en": "You are a professional translator. Translate the user's text into English. Output only the translated text, no explanations.",
     "summarize": "你是一位专业的文档摘要助手。用简洁的中文总结用户提供的内容，不超过几句话。只输出摘要，不作任何解释。",
     "polish_zh": "你是一位中文写作顾问。请对用户的中文文本进行润色，改善语言表达、逻辑连贯性和措辞，但保持原意和风格。只输出润色后的文字，不解释改动。",
     "polish_en": "You are a professional English writing coach. Polish the user's English text to improve clarity, tone, and grammar while preserving the original meaning. Output only the polished text.",
+    "image_ocr": "你是一位专业的图片文字提取助手。\n\n任务目标：\n- 准确提取图片中所有可读文字。\n- 优先保证文字正确，其次尽量保留原有顺序、段落、换行和列表结构。\n- 只输出识别结果，不解释、不总结、不翻译、不补充。\n\n输出要求：\n- 如果图片里有明确文字，就直接输出提取后的纯文本。\n- 如果只有零散短词，也照常输出，不要自行整理成说明。\n- 如果图片几乎没有可识别文字，请只回答：未识别到有效文字",
+    "image_caption": "你是一位专业的图像描述助手。\n\n任务目标：\n- 用简洁、具体、自然的中文描述图片里实际能看到的内容。\n- 优先覆盖主体、动作、场景、物体关系、明显的文字信息和整体氛围。\n- 不要做 OCR 式逐字抄写，除非图片中的文字本身对理解画面很重要。\n\n输出要求：\n- 默认输出 1 段简洁描述；必要时可补 1-2 句关键信息。\n- 不要编造看不见的细节，不要推断身份、地点、时间等不确定信息。\n- 不要输出“这是一张……”这类空泛开头，直接进入描述。",
     "chat": "You are a helpful assistant.",
     "digest": "你是用户的本地工作上下文助手，不是日报生成器。\n\n你的任务是根据用户最近的本地活动记录，帮助用户快速回答这几个问题：\n1. 我最近主要在做什么？\n2. 现在最可能处于哪个任务或项目阶段？\n3. 接下来最自然的下一步是什么？\n\n请遵循以下原则：\n- 优先提炼最核心的 1-3 个项目、任务或主题，不要平均概括所有活动。\n- 重点写对继续工作有帮助的信息，例如项目、文件、主题、操作、未完成事项、阻塞点、待确认点。\n- 终端命令、Git 提交、笔记、AI 对话通常比零散网页浏览更能反映真实工作重点。\n- 剪贴板、浏览器历史这类信息只有在明显相关时才写入。\n- 如果信息不足，不要臆测；可以保守表达。\n- 不要写空泛总结，不要写鼓励语，不要重复原始记录。\n\n请用 Markdown 输出，格式固定为：\n\n## 最近在推进\n用 2-4 句说明最近主要在做什么，尽量点出项目、主题或任务。\n\n## 当前上下文\n用 2-4 条简短要点说明当前做到哪、卡在哪、哪些线索值得记住。\n\n## 下一步建议\n用 2-3 条简短要点写最自然的后续动作，必须基于已有记录，不要发散。\n\n整体简洁、具体、可继续，总长度控制在 220-350 字。",
     "daily_report": "你是用户的本地工作日报助手。\n\n你的任务是根据用户今天多次活动快照，生成一份结构清晰的工作日报。\n\n请遵循以下原则：\n- 提炼今天的主要工作成果，不是流水账。\n- 把相似主题的活动合并，突出项目进展、完成事项、遇到的问题。\n- TODO 项必须具体可执行，直接粘贴就能用，不要写模糊的方向。\n- 不要重复原始记录，不要写鼓励语，不要臆测。\n\n请用 Markdown 输出，格式固定为：\n\n## 今日完成\n用 3-5 条要点描述今天完成的主要事项，每条简洁具体。\n\n## 主要进展\n用 2-3 句话说明今天在哪个项目/主题上取得了推进，推进到哪个阶段。\n\n## 遇到的问题\n用 2-3 条列出今天的阻塞点或待解决问题，没有则写\"无明显阻塞\"。\n\n## TODO\n列出明天最应该处理的具体任务，每条格式为：\n- [ ] 具体动作（项目/文件/功能）\n要求：3-6 条，每条一句话，可直接粘贴到任务管理工具使用。\n\n整体简洁、具体，总长度控制在 300-450 字。",

@@ -15,44 +15,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import markdown as md
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
+
+from lumina.api.rendering import render_markdown_html
+from lumina.ui_meta import collector_sources, digest_icon_for_text, system_prompt_items
 
 router = APIRouter(prefix="/fragments", tags=["fragments"])
 
 _TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
-
-# ── 图标映射（与前端 ICON_MAP 保持一致） ─────────────────────────────────────
-_ICON_MAP: dict[str, str] = {
-    "shell": "🖥",
-    "git": "📁",
-    "clipboard": "📌",
-    "browser": "🌐",
-    "notes": "📝",
-    "calendar": "📅",
-    "markdown": "📄",
-    "ai": "🤖",
-}
-_ICON_KEYS = list(_ICON_MAP.keys())
-
-_PROMPT_LABELS: dict[str, str] = {
-    "translate_to_zh": "翻译为中文",
-    "translate_to_en": "翻译为英文",
-    "summarize": "摘要",
-    "polish_zh": "中文润色",
-    "polish_en": "英文润色",
-    "chat": "对话（默认）",
-    "digest": "活动摘要",
-    "daily_report": "日报",
-    "weekly_report": "周报",
-    "monthly_report": "月报",
-    "asr_zh": "语音识别提示词（中文）",
-    "asr_en": "语音识别提示词（英文）",
-}
-_PROMPT_ORDER = list(_PROMPT_LABELS.keys())
 
 
 def _parse_sections(content: str) -> list[dict]:
@@ -70,12 +43,10 @@ def _parse_sections(content: str) -> list[dict]:
             title = re.sub(r"^#+\s*", "", first_line).strip() or f"条目 {i + 1}"
             s = s.replace(first_line, "", 1).lstrip()
         # 来源图标
-        lc = (title + " " + s).lower()
-        filter_key: Optional[str] = next((k for k in _ICON_KEYS if k in lc), None)
-        icon = _ICON_MAP.get(filter_key, "📋") if filter_key else "📋"
+        icon, filter_key = digest_icon_for_text(f"{title} {s}")
         # 去掉 HTML 注释再渲染 Markdown
         cleaned = re.sub(r"<!--.*?-->", "", s, flags=re.DOTALL)
-        html_body = md.markdown(cleaned, extensions=["fenced_code", "tables"])
+        html_body = _render_markdown(cleaned)
         sections.append(
             {
                 "title": title,
@@ -89,18 +60,113 @@ def _parse_sections(content: str) -> list[dict]:
 
 
 def _system_prompt_items(prompts: Optional[dict]) -> list[dict[str, str]]:
-    if not isinstance(prompts, dict):
-        return []
-    keys = [k for k in prompts.keys() if isinstance(k, str) and not k.startswith("_")]
-    ordered_keys = [k for k in _PROMPT_ORDER if k in keys] + [k for k in keys if k not in _PROMPT_ORDER]
-    return [
-        {
-            "key": key,
-            "label": _PROMPT_LABELS.get(key, key),
-            "value": str(prompts.get(key, "")),
+    return system_prompt_items(prompts)
+
+
+def _render_markdown(content: str) -> str:
+    return render_markdown_html(content)
+
+
+def _format_generated_at_label(generated_at) -> str:
+    if not generated_at:
+        return "尚未生成"
+
+    try:
+        if isinstance(generated_at, (int, float)):
+            d = datetime.fromtimestamp(generated_at)
+        else:
+            generated_text = str(generated_at).strip()
+            if re.fullmatch(r"\d+(?:\.\d+)?", generated_text):
+                d = datetime.fromtimestamp(float(generated_text))
+            else:
+                d = datetime.fromisoformat(generated_text)
+        return "生成于 " + d.strftime("%-m月%-d日 %H:%M")
+    except Exception:
+        return "已生成"
+
+
+def _format_chars_label(chars: int) -> str:
+    value = max(0, int(chars))
+    if value >= 10000:
+        text = f"{value / 10000:.1f}".rstrip("0").rstrip(".")
+        return f"{text} 万字符"
+    return f"{value:,} 字符"
+
+
+def _report_key_label(report_type: str, key: str) -> str:
+    try:
+        if report_type == "daily":
+            d = datetime.strptime(key, "%Y-%m-%d")
+            return f"{d.year}年{d.month}月{d.day}日"
+        if report_type == "weekly":
+            year, week = key.split("-W")
+            return f"{int(year)} 第{int(week)}周"
+        if report_type == "monthly":
+            d = datetime.strptime(key, "%Y-%m")
+            return f"{d.year}年{d.month}月"
+    except ValueError:
+        return key
+    return key
+
+
+def _report_date_header(report_type: str, key: str) -> str:
+    label = {"daily": "日报", "weekly": "周报", "monthly": "月报"}[report_type]
+    try:
+        if report_type == "daily":
+            d = datetime.strptime(key, "%Y-%m-%d")
+            return f"{d.year}年{d.month}月{d.day}日 {label}"
+        if report_type == "weekly":
+            year, week = key.split("-W")
+            return f"{int(year)} 第{int(week)}周 {label}"
+        if report_type == "monthly":
+            d = datetime.strptime(key, "%Y-%m")
+            return f"{d.year}年{d.month}月 {label}"
+    except ValueError:
+        return f"{key} {label}"
+    return f"{key} {label}"
+
+
+def _load_report_fragment_context(report_type: str, key: str) -> dict:
+    from lumina.config import REPORTS_DAILY_DIR, REPORTS_WEEKLY_DIR, REPORTS_MONTHLY_DIR
+
+    dirs = {
+        "daily": REPORTS_DAILY_DIR,
+        "weekly": REPORTS_WEEKLY_DIR,
+        "monthly": REPORTS_MONTHLY_DIR,
+    }
+    report_dir = dirs[report_type]
+    report_keys = sorted(
+        [path.stem for path in report_dir.glob("*.md")],
+        reverse=True,
+    ) if report_dir.is_dir() else []
+
+    if not report_keys:
+        return {
+            "html_content": "",
+            "date_header": "",
+            "selected_key": "",
+            "report_type": report_type,
+            "report_options": [],
+            "empty": True,
         }
-        for key in ordered_keys
-    ]
+
+    selected_key = report_keys[0] if key == "latest" else key
+    report_path = report_dir / f"{selected_key}.md"
+    if not report_path.exists():
+        raise HTTPException(404, "Report not found")
+
+    content = report_path.read_text(encoding="utf-8")
+    return {
+        "html_content": _render_markdown(content),
+        "date_header": _report_date_header(report_type, selected_key),
+        "selected_key": selected_key,
+        "report_type": report_type,
+        "report_options": [
+            {"key": item, "label": _report_key_label(report_type, item)}
+            for item in report_keys
+        ],
+        "empty": False,
+    }
 
 
 # ── Digest 内容区 ──────────────────────────────────────────────────────────────
@@ -114,19 +180,7 @@ async def fragment_digest(request: Request):
     content = load_digest() or ""
 
     generating = status.get("generating", False)
-    generated_at = status.get("generated_at")
-    if generated_at:
-        try:
-            # generated_at 可能是 ISO 字符串或 Unix 时间戳
-            if isinstance(generated_at, (int, float)):
-                d = datetime.fromtimestamp(generated_at)
-            else:
-                d = datetime.fromisoformat(str(generated_at))
-            time_label = "生成于 " + d.strftime("%-m月%-d日 %H:%M")
-        except Exception:
-            time_label = "已生成"
-    else:
-        time_label = "尚未生成"
+    time_label = _format_generated_at_label(status.get("generated_at"))
 
     sections = _parse_sections(content) if content and not generating else []
 
@@ -186,37 +240,21 @@ async def fragment_digest_sources(request: Request):
     from lumina.digest.core import get_debug_info
 
     debug = get_debug_info()
-    collectors = debug.get("collectors", {})
-    names = {
-        "collect_shell_history": "Shell",
-        "collect_git_logs": "Git",
-        "collect_clipboard": "剪贴板",
-        "collect_browser_history": "浏览器",
-        "collect_notes_app": "备忘录",
-        "collect_calendar": "日历",
-        "collect_markdown_notes": "Markdown",
-        "collect_ai_queries": "AI",
-    }
-    icons = {
-        "collect_shell_history": "🖥",
-        "collect_git_logs": "📁",
-        "collect_clipboard": "📌",
-        "collect_browser_history": "🌐",
-        "collect_notes_app": "📝",
-        "collect_calendar": "📅",
-        "collect_markdown_notes": "📄",
-        "collect_ai_queries": "🤖",
-    }
-    sources = []
-    for key, name in names.items():
-        info = collectors.get(key, {})
-        chars = info.get("chars", 0) if isinstance(info, dict) else 0
-        active = chars > 0
-        sources.append({"key": key, "name": name, "icon": icons[key], "active": active, "chars": chars})
+    sources = collector_sources(debug.get("collectors", {}))
+    active_sources = [item for item in sources if item.get("active")]
+    total_chars = sum(int(item.get("chars", 0) or 0) for item in sources)
+    top_sources = sorted(active_sources, key=lambda item: int(item.get("chars", 0) or 0), reverse=True)[:3]
 
     return templates.TemplateResponse(
         "digest_sources.html",
-        {"request": request, "sources": sources},
+        {
+            "request": request,
+            "sources": sources,
+            "active_count": len(active_sources),
+            "total_count": len(sources),
+            "total_chars_label": _format_chars_label(total_chars),
+            "top_sources": top_sources,
+        },
     )
 
 
@@ -274,6 +312,7 @@ async def fragment_pdf_status(job_id: str, request: Request):
 async def fragment_config(request: Request):
     """返回设置表单 HTML 片段（含当前配置值）。"""
     from lumina.config import get_config
+    from lumina.ui_meta import HOME_TAB_DEFS, IMAGE_TASK_DEFS
 
     cfg = get_config()
     return templates.TemplateResponse(
@@ -282,66 +321,30 @@ async def fragment_config(request: Request):
             "request": request,
             "cfg": cfg,
             "system_prompt_items": _system_prompt_items(getattr(cfg, "system_prompts", {})),
+            "home_tab_defs": HOME_TAB_DEFS,
+            "image_task_defs": IMAGE_TASK_DEFS,
         },
     )
 
 
 # ── 报告内容 ────────────────────────────────────────────────────────────────────
 
-@router.get("/report/{report_type}/{key}", response_class=HTMLResponse)
-async def fragment_report(report_type: str, key: str, request: Request):
-    """返回指定报告的 HTML 内容片段。"""
+@router.get("/report/{report_type}", response_class=HTMLResponse)
+async def fragment_report(report_type: str, request: Request, key: str = "latest"):
+    """返回指定报告的 HTML 内容片段，默认显示最新一期。"""
     if report_type not in ("daily", "weekly", "monthly"):
         raise HTTPException(400, "Invalid report type")
-
-    from lumina.config import REPORTS_DAILY_DIR, REPORTS_WEEKLY_DIR, REPORTS_MONTHLY_DIR
-
-    dirs = {
-        "daily": REPORTS_DAILY_DIR,
-        "weekly": REPORTS_WEEKLY_DIR,
-        "monthly": REPORTS_MONTHLY_DIR,
-    }
-    report_dir = dirs[report_type]
-
-    if key == "latest":
-        # 找目录里最新的 .md 文件
-        candidates = sorted(report_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True) if report_dir.is_dir() else []
-        if not candidates:
-            return HTMLResponse('<div style="text-align:center;padding:32px;color:var(--sub);">暂无报告</div>')
-        report_path = candidates[0]
-    else:
-        report_path = report_dir / f"{key}.md"
-        if not report_path.exists():
-            raise HTTPException(404, "Report not found")
-
-    content = report_path.read_text(encoding="utf-8")
-
-    # 从文件名推断日期标题（文件名格式如 2026-04-15.md 或 2026-W16.md）
-    stem = report_path.stem
-    date_header = ""
-    type_labels = {"daily": "日报", "weekly": "周报", "monthly": "月报"}
-    label = type_labels[report_type]
-    try:
-        if report_type == "daily":
-            d = datetime.strptime(stem, "%Y-%m-%d")
-            date_header = f"{d.year}年{d.month}月{d.day}日 {label}"
-        elif report_type == "weekly":
-            # 格式如 2026-W16
-            date_header = f"{stem} {label}"
-        elif report_type == "monthly":
-            d = datetime.strptime(stem, "%Y-%m")
-            date_header = f"{d.year}年{d.month}月 {label}"
-    except ValueError:
-        date_header = f"{stem} {label}"
-
-    html_content = md.markdown(content, extensions=["fenced_code", "tables"])
+    context = _load_report_fragment_context(report_type, key)
     return templates.TemplateResponse(
         "report_content.html",
         {
             "request": request,
-            "html_content": html_content,
-            "date_header": date_header,
-            "key": key,
-            "report_type": report_type,
+            **context,
         },
     )
+
+
+@router.get("/report/{report_type}/{key}", response_class=HTMLResponse)
+async def fragment_report_legacy(report_type: str, key: str, request: Request):
+    """兼容旧路径：/fragments/report/{type}/{key}。"""
+    return await fragment_report(report_type=report_type, request=request, key=key)

@@ -1,8 +1,8 @@
 """
-tests/test_index_html.py — index.html 结构完整性测试
+tests/security/test_index_html.py — index.html 结构完整性测试
 
 每次修改 templates/index.html 或 templates/panels/*.html 后运行
-pytest tests/test_index_html.py 即可。
+pytest tests/security/test_index_html.py 即可。
 
 读取方式：用 Jinja2 渲染 templates/index.html（展开所有 {% include %}），
 与运行时服务端渲染结果一致。
@@ -14,12 +14,13 @@ from pathlib import Path
 
 import pytest
 
-_TEMPLATES_DIR = Path(__file__).parent.parent / "lumina" / "api" / "templates"
-_STATIC_DIR = Path(__file__).parent.parent / "lumina" / "api" / "static"
-PANEL_KEYS = ["digest", "translate", "summarize", "settings"]
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_TEMPLATES_DIR = _PROJECT_ROOT / "lumina" / "api" / "templates"
+_STATIC_DIR = _PROJECT_ROOT / "lumina" / "api" / "static"
+PANEL_KEYS = ["digest", "document", "image", "settings"]
 
 # 非默认面板（CSS 默认 display:none，由 :checked 选择器控制显示）
-NON_DEFAULT_PANELS = ["translate", "summarize", "settings"]
+NON_DEFAULT_PANELS = ["document", "image", "settings"]
 
 
 @pytest.fixture(scope="module")
@@ -30,15 +31,54 @@ def css() -> str:
 @pytest.fixture(scope="module")
 def html() -> str:
     from jinja2 import Environment, FileSystemLoader
+    from lumina.ui_meta import HOME_TAB_DEFS, IMAGE_TASK_DEFS, LEGACY_HOME_TAB_MAP
+
     env = Environment(loader=FileSystemLoader(str(_TEMPLATES_DIR)))
     tmpl = env.get_template("index.html")
     # request 对象只用于 Jinja2 上下文传递，测试中传 None 即可
-    return tmpl.render(request=None)
+    return tmpl.render(
+        request=None,
+        slogan_candidates=[
+            "让 AI 留在本地",
+            "在你的电脑上思考",
+            "你的本地 AI 工作台",
+            "把智能留给自己",
+            "本地运行，安心使用",
+        ],
+        home_ui={
+            "enabled_tabs": ["digest", "document", "image", "settings"],
+            "image_enabled": True,
+            "image_modules": ["image_ocr", "image_caption"],
+            "allow_local_override": True,
+        },
+        image_prompts={
+            "image_ocr": "OCR prompt",
+            "image_caption": "Caption prompt",
+        },
+        asset_ver=0,
+        home_tab_defs=HOME_TAB_DEFS,
+        image_task_defs=IMAGE_TASK_DEFS,
+        legacy_home_tab_map=LEGACY_HOME_TAB_MAP,
+    )
 
 
 @pytest.fixture(scope="module")
 def lines(html) -> list[str]:
     return html.splitlines()
+
+
+@pytest.fixture(scope="module")
+def page_scripts(html) -> str:
+    parts: list[str] = []
+    for match in re.finditer(r'<script[^>]*src="([^"]+)"[^>]*></script>', html):
+        src = match.group(1)
+        if src.startswith("/static/"):
+            rel = src.split("?", 1)[0].removeprefix("/static/")
+            parts.append((_STATIC_DIR / rel).read_text(encoding="utf-8"))
+
+    inline_scripts = re.findall(r"<script(?![^>]*src=)[^>]*>(.*?)</script>", html, re.DOTALL)
+    parts.extend(script for script in inline_scripts if script.strip())
+    return "\n".join(parts)
 
 
 # ── 1. 全局 <div> / <template> 平衡 ──────────────────────────────────────────
@@ -63,8 +103,8 @@ def _panel_bounds(lines: list[str], key: str) -> tuple[int, int]:
     """返回 panel div 行的 (start, end) 行索引（end 为下一 panel 起始或 depth 归零处）。"""
     panel_id = f'id="panel-{key}"'
     start = next(
-        i for i, l in enumerate(lines)
-        if panel_id in l and "<div" in l
+        i for i, line in enumerate(lines)
+        if panel_id in line and "<div" in line
     )
     # 尝试从下一个 panel 推断结束位置
     next_keys = PANEL_KEYS[PANEL_KEYS.index(key) + 1:]
@@ -72,7 +112,7 @@ def _panel_bounds(lines: list[str], key: str) -> tuple[int, int]:
     for nk in next_keys:
         nkw = f'id="panel-{nk}"'
         try:
-            end = next(i for i, l in enumerate(lines) if i > start and nkw in l)
+            end = next(i for i, line in enumerate(lines) if i > start and nkw in line)
             break
         except StopIteration:
             continue
@@ -93,8 +133,8 @@ def _panel_bounds(lines: list[str], key: str) -> tuple[int, int]:
 def test_panel_div_balance(lines, key):
     start, end = _panel_bounds(lines, key)
     section = lines[start:end]
-    opens  = sum(l.count("<div")   for l in section)
-    closes = sum(l.count("</div>") for l in section)
+    opens  = sum(line.count("<div") for line in section)
+    closes = sum(line.count("</div>") for line in section)
 
     # 找到第一个 depth 为负的行，方便 debug
     depth = 0
@@ -123,7 +163,7 @@ def test_radio_tab_inputs_are_hidden(html):
     for key in PANEL_KEYS:
         # 找到该 input 行，检查包含 hidden
         lines = html.splitlines()
-        line = next((l for l in lines if f'id="tab-{key}"' in l and "radio" in l), None)
+        line = next((line for line in lines if f'id="tab-{key}"' in line and "radio" in line), None)
         assert line is not None, f"Radio input for tab-{key} not found"
         assert "hidden" in line, f"Radio input tab-{key} missing 'hidden' attribute: {line.strip()[:120]}"
 
@@ -131,7 +171,7 @@ def test_radio_tab_inputs_are_hidden(html):
 def test_radio_tab_default_digest(html):
     """digest tab 的 radio 必须有 checked 属性（默认选中）。"""
     lines = html.splitlines()
-    line = next((l for l in lines if 'id="tab-digest"' in l and "radio" in l), None)
+    line = next((line for line in lines if 'id="tab-digest"' in line and "radio" in line), None)
     assert line is not None, "Radio input for tab-digest not found"
     assert "checked" in line, f"Default tab 'digest' missing 'checked': {line.strip()[:120]}"
 
@@ -189,11 +229,17 @@ def test_no_cdn_links(html):
 # ── 5. JS 语法（需要 node） ──────────────────────────────────────────────────
 
 def test_js_syntax(html):
-    scripts = re.findall(r"<script[^>]*>(.*?)</script>", html, re.DOTALL)
-    inline = [s for s in scripts if s.strip() and "HTMX_PLACEHOLDER" not in s]
-    assert inline, "No inline scripts found (excluding HTMX placeholder)"
+    script_paths = re.findall(r'<script[^>]*src="([^"]+)"[^>]*></script>', html)
+    inline = re.findall(r"<script(?![^>]*src=)[^>]*>(.*?)</script>", html, re.DOTALL)
+    assert script_paths or inline, "No page scripts found"
 
-    combined = "\n".join(inline)
+    combined_parts = []
+    for src in script_paths:
+        if src.startswith("/static/"):
+            rel = src.split("?", 1)[0].removeprefix("/static/")
+            combined_parts.append((_STATIC_DIR / rel).read_text(encoding="utf-8"))
+    combined_parts.extend(s for s in inline if s.strip() and "HTMX_PLACEHOLDER" not in s)
+    combined = "\n".join(combined_parts)
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".js", delete=False) as f:
             f.write(combined)
@@ -213,10 +259,10 @@ def test_js_syntax(html):
 
 @pytest.mark.parametrize("selector,desc", [
     ('class="modal-overlay"',      "Compare modal overlay"),
-    ('id="summarize-result"',      "Summarize result container"),
+    ('id="document-result"',       "Document result container"),
     ('id="panel-digest"',          "Digest panel"),
-    ('id="panel-translate"',       "Translate panel"),
-    ('id="panel-summarize"',       "Summarize panel"),
+    ('id="panel-document"',        "Document panel"),
+    ('id="panel-image"',           "Image panel"),
     ('id="panel-settings"',        "Settings panel"),
 ])
 def test_key_elements_exist(html, selector, desc):
@@ -229,3 +275,77 @@ def test_key_elements_exist(html, selector, desc):
 ])
 def test_key_css_classes_exist(css, selector, desc):
     assert selector in css, f"Missing CSS class: {desc} ({selector!r})"
+
+
+def test_hero_slogan_uses_session_storage(html):
+    assert "sessionStorage.getItem(storageKey)" in html
+    assert "lumina.heroSlogan" in html
+    assert "data-slogans=" in html
+    assert 'id="hero-slogan"' in html
+    assert 'id="greeting"' in html
+
+
+def test_home_visibility_uses_local_storage(html, page_scripts):
+    assert "lumina.homeTabs" in page_scripts
+    assert "applyHomeTabVisibility" in page_scripts
+    assert 'data-home-ui=' in html
+    assert 'data-home-tabs=' in html
+    assert 'data-legacy-home-tab-map=' in html
+    assert "getLegacyHomeTabMap()" in page_scripts
+
+
+def test_document_panel_supports_tasks_and_three_input_modes(html):
+    assert 'data-task="translate"' in html
+    assert 'data-task="summarize"' in html
+    assert 'id="document-mode-text"' in html
+    assert 'id="document-mode-url"' in html
+    assert 'id="document-mode-file"' in html
+    assert 'id="document-mode-directory"' in html
+    assert "setDocumentTask('translate'" in html
+    assert 'accept=".pdf,.txt,.md,.markdown,text/plain"' in html
+
+
+def test_image_panel_supports_ocr_and_caption(html, page_scripts):
+    assert 'data-task="image_ocr"' in html
+    assert 'data-task="image_caption"' in html
+    assert 'id="panel-image"' in html
+    assert 'id="lab-mode-directory"' in html
+    assert "data-image-prompts=" in html
+    assert "getImagePrompts()" in page_scripts
+    assert "/v1/chat/completions" in page_scripts
+    assert "/v1/media/ocr" not in html
+
+
+def test_batch_workspace_endpoints_and_renderers_exist(page_scripts):
+    assert "/v1/batch/document" in page_scripts
+    assert "/v1/batch/image" in page_scripts
+    assert "renderBatchJob(" in page_scripts
+    assert "pollBatchJob(" in page_scripts
+
+
+def test_htmx_runtime_disables_eval_and_script_tags(html):
+    assert "window.htmx.config.allowEval = false;" in html
+    assert "window.htmx.config.allowScriptTags = false;" in html
+
+
+def test_document_panel_escapes_summary_errors(page_scripts):
+    assert "错误：' + escapeHtml(e.message) + '" in page_scripts
+
+
+def test_settings_helpers_live_in_main_page_script(page_scripts):
+    assert "function switchSettingsSubTab(key, btn)" in page_scripts
+    assert "function setProviderType(type, btn)" in page_scripts
+    assert "document.body.addEventListener('htmx:afterSwap'" in page_scripts
+
+
+def test_digest_has_document_and_image_cards(html):
+    assert "DOCUMENT" in html
+    assert "IMAGE" in html
+    assert "默认摘要" in html
+    assert 'aria-label="切换主题"' in html
+
+
+def test_digest_report_tabs_request_latest_reports(html):
+    assert 'hx-get="/fragments/report/daily?key=latest"' in html
+    assert 'hx-get="/fragments/report/weekly?key=latest"' in html
+    assert 'hx-get="/fragments/report/monthly?key=latest"' in html

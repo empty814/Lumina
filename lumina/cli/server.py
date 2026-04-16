@@ -114,67 +114,10 @@ def _start_digest_timer(llm, interval: int = 3600, uvicorn_loop: list = None):
     logger.info("Digest timer started, next trigger in %.0fs (interval=%ds)", delay, interval)
 
 
-async def _maybe_backfill_reports(llm) -> None:
-    """服务启动时补生成缺失的报告。
+async def _maybe_backfill_reports(llm, now=None) -> None:
+    from lumina.digest.scheduler import maybe_backfill_reports
 
-    对每种报告类型，判断「本周期的报告应该已经存在但缺失」时进行补生成：
-    - 日报：今天的日报不存在，且当前时间已经过了 notify_time（说明定时器已错过）
-    - 周报：本周（周一起算）已过去至少 1 天，上周的周报不存在
-    - 月报：本月已过去至少 1 天，上月的月报不存在
-    """
-    import datetime as _dt
-    from lumina.digest import generate_report
-    from lumina.digest.config import get_cfg
-    from lumina.digest.reports import (
-        daily_key, weekly_key, monthly_key,
-        load_report,
-    )
-    from lumina.cli.utils import is_digest_enabled
-
-    if not is_digest_enabled():
-        return
-
-    cfg = get_cfg()
-    now = _dt.datetime.now()
-    today = now.date()
-
-    # ── 日报：今天是否已过 notify_time 且报告不存在 ────────────────────────────
-    try:
-        notify_hour, notify_minute = map(int, (cfg.notify_time or "20:00").split(":"))
-    except Exception:
-        notify_hour, notify_minute = 20, 0
-    notify_passed = (now.hour, now.minute) >= (notify_hour, notify_minute)
-    if notify_passed and not load_report("daily", daily_key(today)):
-        logger.info("Backfill: today's daily report missing, generating...")
-        try:
-            await generate_report(llm, "daily", daily_key(today))
-        except Exception as e:
-            logger.warning("Backfill: daily report failed: %s", e)
-
-    # ── 周报：今天不是触发日（即本周已过去 >0 天），且上周周报不存在 ─────────────
-    weekly_day = cfg.weekly_report_day  # 0=Mon
-    days_since_report_day = (today.weekday() - weekly_day) % 7
-    if days_since_report_day > 0:
-        last_week = today - _dt.timedelta(days=days_since_report_day + 1)
-        wk = weekly_key(last_week)
-        if not load_report("weekly", wk):
-            logger.info("Backfill: weekly report %s missing, generating...", wk)
-            try:
-                await generate_report(llm, "weekly", wk)
-            except Exception as e:
-                logger.warning("Backfill: weekly report failed: %s", e)
-
-    # ── 月报：今天不是触发日（monthly_report_day），且上月月报不存在 ───────────
-    monthly_day = cfg.monthly_report_day  # 1-28
-    if today.day != monthly_day:
-        last_month = today.replace(day=1) - _dt.timedelta(days=1)
-        mk = monthly_key(last_month)
-        if not load_report("monthly", mk):
-            logger.info("Backfill: monthly report %s missing, generating...", mk)
-            try:
-                await generate_report(llm, "monthly", mk)
-            except Exception as e:
-                logger.warning("Backfill: monthly report failed: %s", e)
+    await maybe_backfill_reports(llm, now=now)
 
 
 def _start_daily_notify_timer(llm, uvicorn_loop: list = None):
@@ -391,6 +334,26 @@ def _ensure_quick_action_installed() -> None:
         logger.debug("Quick Action install error: %s", e)
 
 
+def _resolve_menubar_enabled(cfg, args) -> bool:
+    override = getattr(args, "menubar", None)
+    if override is not None:
+        return bool(override)
+    desktop_cfg = getattr(cfg, "desktop", None)
+    if desktop_cfg is not None:
+        return bool(getattr(desktop_cfg, "menubar_enabled", True))
+    return True
+
+
+def _build_server_restart_command(*, menubar_enabled: bool | None = None) -> list[str]:
+    extra_args = sys.argv[2:] if len(sys.argv) > 1 and sys.argv[1] == "server" else []
+    filtered_args = [arg for arg in extra_args if arg not in ("--menubar", "--no-menubar")]
+    if menubar_enabled is True:
+        filtered_args.append("--menubar")
+    elif menubar_enabled is False:
+        filtered_args.append("--no-menubar")
+    return [sys.argv[0], "server", *filtered_args]
+
+
 # ── 菜单栏 App ────────────────────────────────────────────────────────────────
 
 def _run_with_menubar(fastapi_app, cfg, llm, config_path: str | None = None):
@@ -400,6 +363,7 @@ def _run_with_menubar(fastapi_app, cfg, llm, config_path: str | None = None):
     import rumps
     from lumina.cli.utils import (
         is_digest_enabled, persist_digest_enabled, persist_ptt_enabled, persist_host,
+        persist_menubar_enabled,
         remove_pid, uvicorn_log_config,
     )
 
@@ -441,11 +405,11 @@ def _run_with_menubar(fastapi_app, cfg, llm, config_path: str | None = None):
             self._refresh_ip_label()
             self.menu = [
                 rumps.MenuItem("打开界面", callback=self._open_ui),
-                rumps.MenuItem("打开设置", callback=self._open_settings),
                 self._ip_item,
                 self._digest_toggle_item,
                 self._ptt_toggle_item,
                 self._lan_toggle_item,
+                rumps.MenuItem("关闭菜单栏显示", callback=self._hide_menubar),
                 None,
                 rumps.MenuItem("重启服务", callback=self._restart),
                 rumps.MenuItem("退出 Lumina", callback=self._quit),
@@ -453,7 +417,7 @@ def _run_with_menubar(fastapi_app, cfg, llm, config_path: str | None = None):
 
         def _refresh_digest_menu_label(self):
             self._digest_toggle_item.title = (
-                "停止日报定时采集" if is_digest_enabled() else "开启日报定时采集"
+                "停止活动采集" if is_digest_enabled() else "开启活动采集"
             )
 
         def _toggle_digest(self, _):
@@ -510,7 +474,21 @@ def _run_with_menubar(fastapi_app, cfg, llm, config_path: str | None = None):
             t.join(timeout=5)
             remove_pid()
             import subprocess
-            subprocess.Popen([sys.executable] + sys.argv)
+            subprocess.Popen(_build_server_restart_command(menubar_enabled=True))
+            rumps.quit_application()
+
+        def _hide_menubar(self, _):
+            try:
+                persist_menubar_enabled(False, config_path=config_path)
+            except Exception as e:
+                logger.error("Failed to persist menubar toggle: %s", e)
+                return
+            logger.info("Menubar disabled via menubar menu, restarting...")
+            server.should_exit = True
+            t.join(timeout=5)
+            remove_pid()
+            import subprocess
+            subprocess.Popen(_build_server_restart_command(menubar_enabled=False))
             rumps.quit_application()
 
         def _get_local_ip(self) -> str:
@@ -539,17 +517,12 @@ def _run_with_menubar(fastapi_app, cfg, llm, config_path: str | None = None):
 
             open_url(f"http://127.0.0.1:{cfg.port}")
 
-        def _open_settings(self, _):
-            from lumina.platform_utils import open_url
-
-            open_url(f"http://127.0.0.1:{cfg.port}/#settings")
-
         def _restart(self, _):
             server.should_exit = True
             t.join(timeout=5)
             remove_pid()
             import subprocess
-            subprocess.Popen([sys.executable] + sys.argv)
+            subprocess.Popen(_build_server_restart_command(menubar_enabled=True))
             rumps.quit_application()
 
         def _quit(self, _):
@@ -570,6 +543,9 @@ def _run_with_menubar(fastapi_app, cfg, llm, config_path: str | None = None):
     except Exception:
         logger.exception("Menubar app crashed")
     finally:
+        scheduler = getattr(fastapi_app.state, "digest_scheduler", None)
+        if scheduler is not None:
+            scheduler.stop()
         server.should_exit = True
         remove_pid()
 
@@ -580,12 +556,15 @@ def cmd_server(args):
     import threading
     import uvicorn
     from lumina.config import get_config
+    from lumina.config_runtime import resolve_config_path as resolve_runtime_config_path
+    from lumina.config_runtime import set_active_config_path
     from lumina.asr.transcriber import Transcriber
+    from lumina.digest.scheduler import DigestScheduler
     from lumina.engine.llm import LLMEngine
     from lumina.api.server import create_app
     from lumina.cli.utils import (
-        setup_logging, sync_user_config, resolve_config_path,
-        is_digest_enabled, is_port_in_use, print_ready_banner,
+        setup_logging, sync_user_config,
+        is_port_in_use, print_ready_banner,
         write_pid, remove_pid, notify, uvicorn_log_config,
     )
     from lumina.cli.setup import ensure_model, needs_lite_setup, lite_setup_wizard
@@ -603,13 +582,15 @@ def cmd_server(args):
     if args.log_level:
         os.environ["LUMINA_LOG_LEVEL"] = args.log_level
 
+    config_path = getattr(args, "config", None) or resolve_runtime_config_path()
+    set_active_config_path(config_path)
+
     if needs_lite_setup():
         lite_setup_wizard()
 
-    sync_user_config()
+    sync_user_config(config_path)
     from lumina.cli.utils import sync_static
     sync_static()
-    config_path = getattr(args, "config", None) or resolve_config_path()
     cfg = get_config(config_path)
     ensure_model(cfg)
 
@@ -674,49 +655,27 @@ def cmd_server(args):
         finally:
             _request_history.shutdown()
 
-    fastapi_app = create_app(llm, transcriber, lifespan=_cmd_lifespan)
-
-    print_ready_banner(cfg.host, cfg.port)
-    write_pid()
-
-    async def _startup_digest_coro():
-        from lumina.digest import maybe_generate_digest
-        await maybe_generate_digest(llm)
-        await _maybe_backfill_reports(llm)
-
-    def _startup_digest():
-        import asyncio
-        import time
-        for _ in range(50):
-            if _uvicorn_loop:
-                break
-            time.sleep(0.1)
-        if not _uvicorn_loop:
-            logger.warning("Digest startup: uvicorn loop not ready, skipping")
-            return
-        loop = _uvicorn_loop[0]
-        future = asyncio.run_coroutine_threadsafe(_startup_digest_coro(), loop)
-        # 启动时首次生成摘要可以等待完成（阻塞 daemon 线程，不影响主线程）
-        try:
-            future.result(timeout=300)
-        except Exception as e:
-            logger.error("Digest startup failed: %s", e)
-
-    if is_digest_enabled():
-        threading.Thread(target=_startup_digest, daemon=True).start()
-    else:
-        logger.info("Digest is disabled: skip startup generation")
-
     _env_interval = int(os.environ.get("LUMINA_DIGEST_INTERVAL", 0))
     _cfg_interval = int(cfg.digest.get("refresh_hours", 1.0) * 3600)
     digest_interval = getattr(args, "digest_interval", None) or _env_interval or _cfg_interval
-    _start_digest_timer(llm, interval=digest_interval, uvicorn_loop=_uvicorn_loop)
-    _start_daily_notify_timer(llm, uvicorn_loop=_uvicorn_loop)
+    fastapi_app = create_app(llm, transcriber, lifespan=_cmd_lifespan)
+    digest_scheduler = DigestScheduler(
+        llm=llm,
+        get_loop=lambda: _uvicorn_loop[0] if _uvicorn_loop else None,
+        digest_interval_override=digest_interval,
+    )
+    fastapi_app.state.digest_scheduler = digest_scheduler
+
+    print_ready_banner(cfg.host, cfg.port)
+    write_pid()
+    digest_scheduler.start()
 
     if sys.platform == "darwin":
         threading.Thread(target=_ensure_quick_action_installed, daemon=True).start()
 
-    if sys.platform == "darwin" and (_EDITION in ("full", "lite") or getattr(args, "menubar", False)):
+    menubar_enabled = _resolve_menubar_enabled(cfg, args)
+
+    if sys.platform == "darwin" and menubar_enabled:
         _run_with_menubar(fastapi_app, cfg, llm, config_path=config_path)
     else:
         _start_ptt(cfg, menubar_app=None)
@@ -724,6 +683,7 @@ def cmd_server(args):
             uvicorn.run(fastapi_app, host=cfg.host, port=cfg.port,
                         log_level=cfg.log_level.lower(), log_config=uvicorn_log_config(cfg.log_level))
         finally:
+            digest_scheduler.stop()
             remove_pid()
 
 
@@ -749,7 +709,12 @@ def cmd_stop(args):
 def cmd_restart(args):
     import signal
     import subprocess
-    from lumina.cli.utils import read_pid, remove_pid
+    from lumina.cli.utils import (
+        read_pid,
+        remove_pid,
+        resolve_config_path,
+        persist_menubar_enabled,
+    )
 
     pid = read_pid()
     if pid is not None:
@@ -760,6 +725,40 @@ def cmd_restart(args):
             pass
         remove_pid()
 
-    cmd = [sys.argv[0], "server"]
+    menubar_override = getattr(args, "menubar", None)
+    if menubar_override is not None:
+        persist_menubar_enabled(bool(menubar_override), config_path=resolve_config_path())
+
+    cmd = _build_server_restart_command(menubar_enabled=menubar_override)
     print("正在重启 Lumina…")
     subprocess.Popen(cmd)
+
+
+def cmd_menubar(args):
+    import signal
+    import subprocess
+    from lumina.cli.utils import (
+        read_pid,
+        remove_pid,
+        resolve_config_path,
+        persist_menubar_enabled,
+    )
+
+    enabled = args.state == "on"
+    persist_menubar_enabled(enabled, config_path=resolve_config_path())
+
+    pid = read_pid()
+    if pid is None:
+        state_text = "开启" if enabled else "关闭"
+        print(f"已将菜单栏显示设置为{state_text}，下次启动生效。")
+        return
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+        print(f"已停止 Lumina（PID {pid}）。")
+    except ProcessLookupError:
+        pass
+    remove_pid()
+
+    print(f"正在以菜单栏{'开启' if enabled else '关闭'}状态重启 Lumina…")
+    subprocess.Popen(_build_server_restart_command(menubar_enabled=enabled))

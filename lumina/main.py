@@ -32,7 +32,7 @@ def main():
         except RuntimeError:
             pass
 
-    from lumina.cli.server import cmd_server, cmd_stop, cmd_restart
+    from lumina.cli.server import cmd_server, cmd_stop, cmd_restart, cmd_menubar
     from lumina.cli.pdf import cmd_pdf, cmd_summarize, cmd_watch
     from lumina.cli.text import cmd_polish, cmd_popup
 
@@ -55,9 +55,12 @@ def main():
                           choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     p_server.add_argument("--digest-interval", dest="digest_interval", type=int, default=None,
                           help="日报定时间隔（秒），默认读取 config.json refresh_hours（1h），测试时可改小如 30")
-    p_server.add_argument("--no-menubar", dest="menubar", action="store_false",
-                          help="禁用 macOS 菜单栏图标")
-    p_server.set_defaults(menubar=True)
+    menubar_group = p_server.add_mutually_exclusive_group()
+    menubar_group.add_argument("--menubar", dest="menubar", action="store_true",
+                               help="启用 macOS 菜单栏图标")
+    menubar_group.add_argument("--no-menubar", dest="menubar", action="store_false",
+                               help="禁用 macOS 菜单栏图标")
+    p_server.set_defaults(menubar=None)
     p_server.set_defaults(func=cmd_server)
 
     # ── lumina stop ───────────────────────────────────────────────────────────
@@ -66,7 +69,18 @@ def main():
 
     # ── lumina restart ────────────────────────────────────────────────────────
     p_restart = sub.add_parser("restart", help="Restart the Lumina service")
+    restart_menubar_group = p_restart.add_mutually_exclusive_group()
+    restart_menubar_group.add_argument("--menubar", dest="menubar", action="store_true",
+                                       help="重启后显示 macOS 菜单栏图标")
+    restart_menubar_group.add_argument("--no-menubar", dest="menubar", action="store_false",
+                                       help="重启后隐藏 macOS 菜单栏图标")
+    p_restart.set_defaults(menubar=None)
     p_restart.set_defaults(func=cmd_restart)
+
+    # ── lumina menubar ────────────────────────────────────────────────────────
+    p_menubar = sub.add_parser("menubar", help="Toggle macOS menubar visibility")
+    p_menubar.add_argument("state", choices=["on", "off"], help="on=显示菜单栏，off=隐藏菜单栏")
+    p_menubar.set_defaults(func=cmd_menubar)
 
     # ── lumina pdf ────────────────────────────────────────────────────────────
     p_pdf = sub.add_parser("pdf", help="Translate PDF file(s) via pdf2zh")

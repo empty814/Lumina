@@ -1,6 +1,6 @@
 # Lumina
 
-你的桌面上运行的私人 AI 工具箱。不联网，不收费，不上传任何数据。
+本地运行的 AI 工具箱。不联网，不收费，不上传。
 
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-black)](https://github.com/wnma3mz/Lumina)
 [![License](https://img.shields.io/github/license/wnma3mz/Lumina)](LICENSE)
@@ -9,17 +9,21 @@
 
 ## 能做什么
 
-### 📄 PDF 翻译 · 总结
+### 📋 活动回顾
 
-在 Finder 右键选中 PDF，一键翻译或总结，结果直接保存到同目录。支持单文件、整个目录批量处理，以及 URL、arXiv 链接直接下载翻译。
-
-### 📋 每日活动日报
-
-自动采集你的 Shell 命令、Git 提交、浏览记录、备忘录、日历，每小时生成一份「今天做了什么」的简报，帮你找回上下文、追踪进展。
+自动采集你的 Shell 命令、Git 提交、浏览记录、备忘录、日历，定期生成简报，帮你找回上下文、追踪进展。
 
 ### 🌐 兼容浏览器翻译插件
 
-把任意 OpenAI 兼容插件（沉浸式翻译、OpenAI Translator 等）的 API 地址填为 `http://127.0.0.1:31821/v1`，立即获得本地模型驱动的网页翻译。
+把任意 OpenAI 兼容插件（沉浸式翻译、OpenAI Translator 等）的 API 地址填为 `http://127.0.0.1:31821/v1/chat/completions`，立即获得本地模型驱动的网页翻译。
+
+### 📄 PDF 翻译 · 总结
+
+本地文件翻译或总结，结果直接保存到同目录。支持单文件、整个目录批量处理，以及 URL、arXiv 链接直接下载翻译。
+
+### 📷 图片理解
+
+支持图片文件和链接、整个目录批量处理，可做 OCR 提取，也可以生成简洁 Caption。
 
 ---
 
@@ -39,6 +43,10 @@ uv run lumina server           # 启动服务
 - macOS：`uv sync && uv run lumina server`
 - Linux：`bash scripts/install_linux.sh`
 - Windows：`powershell -ExecutionPolicy Bypass -File scripts/install_windows.ps1`
+
+
+<details>
+<summary>展开查看：平台入口集成、平台验证手册、支持矩阵</summary>
 
 ### 平台入口集成
 
@@ -63,6 +71,8 @@ uv run lumina server           # 启动服务
 | Finder Quick Action / 系统服务 | ✅ | 入口形态不同 | 入口形态不同 |
 | 日报 Apple 专属数据源（Notes / Calendar / Safari） | ✅ | — | — |
 
+</details>
+
 ---
 
 ## 使用方式
@@ -83,28 +93,13 @@ Windows / Linux：可直接使用 Web UI 或命令行完成同样的翻译 / 总
 lumina pdf paper.pdf                                # 翻译本地 PDF
 lumina pdf https://arxiv.org/pdf/2104.09864        # 翻译 URL
 lumina pdf ./papers/ -o ./translated               # 翻译整个目录
-lumina summarize paper.pdf                         # 总结
-lumina summarize paper.pdf --stdout                # 总结并打印到终端
-uv run python scripts/lumina_file_action.py translate paper.pdf
-uv run python scripts/lumina_file_action.py summarize paper.pdf
 ```
-
-Windows / Linux 桌面入口可调用同一套文件动作脚本：
-- PDF：翻译 / 总结
-- TXT / MD：润色
-- 输出默认写回源文件同目录
 
 ---
 
-### 每日活动日报
+### 活动回顾
 
 服务启动后自动运行。访问 `http://127.0.0.1:31821` 查看网页界面，或：
-
-```bash
-curl http://127.0.0.1:31821/v1/digest             # 查看当前日报
-curl -X POST http://127.0.0.1:31821/v1/digest/refresh  # 立即重新生成
-curl http://127.0.0.1:31821/v1/digest/export      # 下载完整历史（.md 文件）
-```
 
 日报每小时自动更新，默认每天 20:00 推送系统通知。采集范围：
 
@@ -117,54 +112,6 @@ curl http://127.0.0.1:31821/v1/digest/export      # 下载完整历史（.md 文
 | Markdown 笔记 | 扫描目录内 .md 文件 |
 | 日历 | 今日及近期日程（macOS） |
 | AI 对话 | Cursor IDE / Claude 等对话记录 |
-
----
-
-### 浏览器插件接入
-
-将插件的 API 地址设为：
-
-```
-http://127.0.0.1:31821/v1
-```
-
-模型名填 `lumina`，API Key 随便填。
-
-手机 PWA 访问：在 Safari 打开 `http://Mac局域网IP:31821`，添加到主屏幕。
-
----
-
-## 配置
-
-配置文件位于 `~/.lumina/config.json`，不存在时使用默认值。
-
-```json
-{
-  "provider": {
-    "type": "local",
-    "model_path": null
-  },
-  "whisper_model": "",
-  "digest": {
-    "scan_dirs": [],
-    "history_hours": 24,
-    "refresh_hours": 1,
-    "notify_time": "20:00"
-  }
-}
-```
-
-| 字段 | 说明 | 默认值 |
-|---|---|---|
-| `provider.type` | `local`（本地模型；macOS=MLX，Win/Linux=llama.cpp）或 `openai`（远程接口） | `local` |
-| `provider.model_path` | 本地模型路径，`null` 时按平台自动下载默认模型 | `null` |
-| `provider.llama_cpp.model_path` | 显式指定 GGUF 模型路径 | `null` |
-| `provider.openai.base_url` | 远程 API 地址（type=openai 时必填） | — |
-| `whisper_model` | 语音模型 ID，留空时按平台使用默认值 | `""` |
-| `digest.scan_dirs` | 日报扫描目录，空数组时扫描 Documents / Desktop 等默认目录 | `[]` |
-| `digest.history_hours` | 采集时间窗口（小时） | `24` |
-| `digest.refresh_hours` | 日报更新间隔（小时） | `1` |
-| `digest.notify_time` | 每日通知时间，空字符串禁用 | `"20:00"` |
 
 ---
 
@@ -207,6 +154,15 @@ http://127.0.0.1:31821/v1
         └─────────────────────┘
 ```
 
+### 运行时模块边界
+
+- `lumina/config.py`：配置 dataclass 与环境变量覆盖
+- `lumina/config_runtime.py`：活动配置文件解析、原子写回、运行时同步
+- `lumina/digest/scheduler.py`：digest 启动任务、补齐 backfill、定时器重排期
+- `lumina/api/rendering.py`：不可信 Markdown / HTML 的统一安全渲染入口
+- `lumina/ui_meta.py`：首页 tab、图片任务、Prompt 顺序、collector 元数据注册表
+- `lumina/providers/`：后端能力适配与 capability 契约
+
 ### HTTP 接口
 
 ```bash
@@ -221,6 +177,21 @@ POST /v1/summarize
 # Chat（OpenAI 兼容）
 POST /v1/chat/completions
 {"model": "lumina", "messages": [{"role": "user", "content": "你好"}]}
+
+# Chat + 图片输入（支持 image_url / data URL）
+POST /v1/chat/completions
+{
+  "model": "lumina",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "请描述这张图"},
+        {"type": "image_url", "image_url": {"url": "https://example.com/demo.png"}}
+      ]
+    }
+  ]
+}
 
 # 语音转文字
 POST /v1/audio/transcriptions
@@ -256,9 +227,12 @@ powershell -ExecutionPolicy Bypass -File scripts/install_windows_sendto.ps1
 ```
 lumina/
   main.py              # CLI 入口
-  config.py            # 配置加载
+  config.py            # 配置 dataclass 与环境变量覆盖
+  config_runtime.py    # 活动配置路径 / 原子写回 / 热更新同步
+  ui_meta.py           # UI 元数据注册表
   api/
-    server.py          # FastAPI 路由（含 PWA manifest、CORS）
+    server.py          # FastAPI 装配（依赖注入、首页上下文）
+    rendering.py       # Markdown / HTML 安全渲染
     templates/         # Jinja2 模板（Web UI 主页 + HTMX 片段）
       index.html       # 主页面（PWA，内联 HTMX）
       panels/          # 各 tab 面板初始 HTML
@@ -268,16 +242,31 @@ lumina/
       style.css        # 样式（含 bento-card 设计系统）
   providers/
     local.py           # mlx-lm 本地推理（Continuous Batching）
+    llama_cpp.py       # llama.cpp 本地推理（Windows / Linux / CPU）
     openai.py          # OpenAI 兼容远程接口
   digest/
-    core.py            # 日报生成调度
+    core.py            # digest 核心生成逻辑
+    scheduler.py       # 启动补齐、定时任务、配置热更新重排期
     collectors/        # 数据采集（shell / git / 浏览器 / 备忘录 / 日历 / AI）
   asr/                 # Whisper 语音转文字
   pdf_translate.py     # lumina pdf 实现
   pdf_summarize.py     # lumina summarize 实现
+tests/
+  api/                 # HTTP / 片段 / 配置接口测试
+  cli/                 # CLI / menubar / popup / 文件动作测试
+  digest/              # digest / report / scheduler 测试
+  providers/           # provider 能力 / 采样 / 平台适配测试
+  security/            # 模板结构与 HTML 渲染安全测试
 scripts/
   build_full.sh        # PyInstaller 打包
   install_quick_action.sh
+```
+
+### 验证与回归
+
+```bash
+uv run pytest tests/api tests/cli tests/digest tests/providers tests/security
+uv run python scripts/smoke_check.py
 ```
 
 </details>

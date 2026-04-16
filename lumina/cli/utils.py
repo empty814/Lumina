@@ -1,24 +1,26 @@
 """
 lumina/cli/utils.py — 启动共用工具函数
 
-包含：日志配置、配置路径解析、config 深度合并同步、
+包含：日志配置、配置路径解析、config 模板同步、
 持久化写入、PID 管理、系统通知、端口检测、就绪横幅等。
 """
-import json
 import logging
 import os
 import shutil
 from pathlib import Path
 
+from lumina.config_runtime import (
+    read_mutable_config_data,
+    resolve_config_path,
+    sync_runtime_config,
+    write_config_atomic,
+)
 from lumina.platform_support.desktop import get_desktop_services
 
 logger = logging.getLogger("lumina")
 
 # 打包时注入的版本标记
 _EDITION = os.environ.get("LUMINA_EDITION")
-
-# 用户级配置文件路径
-_USER_CONFIG_PATH = Path.home() / ".lumina" / "config.json"
 
 # PID 文件
 _PID_FILE = Path.home() / ".lumina" / "lumina.pid"
@@ -67,62 +69,23 @@ def uvicorn_log_config(level: str = "INFO") -> dict:
 
 # ── Config 工具 ───────────────────────────────────────────────────────────────
 
-def deep_merge(base: dict, override: dict) -> dict:
-    """
-    深度合并：以 base 为模板，override 里有的 key 优先保留，
-    base 里有但 override 里没有的 key 补入。
-    不修改入参，返回新 dict。
-    """
-    result = dict(base)
-    for k, v in override.items():
-        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
-            result[k] = deep_merge(result[k], v)
-        else:
-            result[k] = v
-    return result
 
-
-def _flatten_keys(d: dict, prefix: str = "") -> set:
-    """递归收集所有叶节点路径，用于 diff 日志。"""
-    keys = set()
-    for k, v in d.items():
-        full = f"{prefix}.{k}" if prefix else k
-        if isinstance(v, dict):
-            keys |= _flatten_keys(v, full)
-        else:
-            keys.add(full)
-    return keys
-
-
-def sync_user_config() -> None:
+def sync_user_config(config_path: str | None = None) -> None:
     """
     启动时将项目模板 config.json 里新增的字段补入用户配置，
     用户已有的值一律不覆盖。
     """
-    if not _USER_CONFIG_PATH.exists():
+    resolved = resolve_config_path(config_path)
+    if not resolved:
         return
-
-    pkg_cfg_path = Path(__file__).parent.parent / "config.json"
-    if not pkg_cfg_path.exists():
-        return
-
-    try:
-        with open(pkg_cfg_path, "r", encoding="utf-8") as f:
-            template = json.load(f)
-        with open(_USER_CONFIG_PATH, "r", encoding="utf-8") as f:
-            user = json.load(f)
-    except Exception as e:
-        logger.warning("Config sync: failed to read config files: %s", e)
-        return
-
-    merged = deep_merge(template, user)
-    if merged == user:
+    target = Path(resolved)
+    if not target.exists():
         return
 
     try:
-        with open(_USER_CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(merged, f, indent=2, ensure_ascii=False)
-        new_keys = [k for k in _flatten_keys(merged) if k not in _flatten_keys(user)]
+        new_keys = sync_runtime_config(target)
+        if not new_keys:
+            return
         logger.info("Config sync: added %d new key(s): %s", len(new_keys), new_keys)
     except Exception as e:
         logger.warning("Config sync: failed to write user config: %s", e)
@@ -149,51 +112,31 @@ def sync_static() -> None:
     dest.mkdir(parents=True, exist_ok=True)
 
     updated = []
-    for src_file in src.iterdir():
+    for src_file in src.rglob("*"):
         if not src_file.is_file():
             continue
-        dst_file = dest / src_file.name
+        rel_path = src_file.relative_to(src)
+        dst_file = dest / rel_path
+        dst_file.parent.mkdir(parents=True, exist_ok=True)
         # 只在内容变化时覆盖（比较文件大小+mtime，避免无谓 IO）
         if dst_file.exists():
             ss, ds = src_file.stat(), dst_file.stat()
             if ss.st_size == ds.st_size and ss.st_mtime <= ds.st_mtime:
                 continue
         shutil.copy2(str(src_file), str(dst_file))
-        updated.append(src_file.name)
+        updated.append(str(rel_path))
 
     if updated:
         logger.info("sync_static: updated %s", updated)
 
-
-def resolve_config_path() -> str | None:
-    """
-    确定加载哪个 config.json：
-      1. 用户级配置（~/.lumina/config.json）优先
-      2. 返回 None，由 get_config() 用默认路径
-    """
-    if _USER_CONFIG_PATH.exists():
-        return str(_USER_CONFIG_PATH)
-    return None
-
-
 # ── 持久化写入 ────────────────────────────────────────────────────────────────
 
 def _read_or_init_config(config_path: str | None) -> dict:
-    target = _USER_CONFIG_PATH
-    source = Path(config_path) if config_path else (Path(__file__).parent.parent / "config.json")
-    if target.exists():
-        with open(target, "r", encoding="utf-8") as f:
-            return json.load(f)
-    if source.exists():
-        with open(source, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+    return read_mutable_config_data(config_path)
 
 
 def _write_user_config(data: dict) -> None:
-    _USER_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(_USER_CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    write_config_atomic(data)
 
 
 def persist_ptt_enabled(enabled: bool, config_path: str | None = None) -> None:
@@ -203,13 +146,13 @@ def persist_ptt_enabled(enabled: bool, config_path: str | None = None) -> None:
         ptt_cfg = {}
     ptt_cfg["enabled"] = bool(enabled)
     data["ptt"] = ptt_cfg
-    _write_user_config(data)
+    write_config_atomic(data, config_path)
 
 
 def persist_host(host: str, config_path: str | None = None) -> None:
     data = _read_or_init_config(config_path)
     data["host"] = host
-    _write_user_config(data)
+    write_config_atomic(data, config_path)
 
 
 def persist_digest_enabled(enabled: bool, config_path: str | None = None) -> None:
@@ -219,7 +162,17 @@ def persist_digest_enabled(enabled: bool, config_path: str | None = None) -> Non
         digest_cfg = {}
     digest_cfg["enabled"] = bool(enabled)
     data["digest"] = digest_cfg
-    _write_user_config(data)
+    write_config_atomic(data, config_path)
+
+
+def persist_menubar_enabled(enabled: bool, config_path: str | None = None) -> None:
+    data = _read_or_init_config(config_path)
+    desktop_cfg = data.get("desktop")
+    if not isinstance(desktop_cfg, dict):
+        desktop_cfg = {}
+    desktop_cfg["menubar_enabled"] = bool(enabled)
+    data["desktop"] = desktop_cfg
+    write_config_atomic(data, config_path)
 
 
 # ── PID 管理 ──────────────────────────────────────────────────────────────────

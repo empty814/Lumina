@@ -8,12 +8,16 @@ import asyncio
 import threading
 from typing import AsyncIterator, Optional
 
-from .base import BaseProvider
+from .base import BaseProvider, ProviderCapabilities
 from lumina.sampling import DEFAULT_TEMPERATURE, DEFAULT_TOP_P
 
 
 class LlamaCppProvider(BaseProvider):
     """llama-cpp-python 推理后端，跨平台（Windows / Linux / macOS CPU）。"""
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(supports_image_input=False)
 
     def __init__(self, model_path: str, n_gpu_layers: int = -1, n_ctx: int = 4096):
         """
@@ -73,6 +77,10 @@ class LlamaCppProvider(BaseProvider):
                     max_tokens=max_tokens,
                     temperature=temperature,
                     top_p=top_p,
+                    top_k=top_k,
+                    min_p=min_p,
+                    presence_penalty=presence_penalty,
+                    repeat_penalty=repetition_penalty,
                     stream=True,
                 ):
                     delta = chunk["choices"][0].get("delta", {})

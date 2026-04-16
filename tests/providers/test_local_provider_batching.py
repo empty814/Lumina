@@ -695,6 +695,94 @@ def test_render_prompt_falls_back_when_tokenizer_has_no_thinking_flag():
     assert prompt == "prompt"
 
 
+@pytest.mark.asyncio
+async def test_generate_messages_uses_vlm_for_image_inputs(monkeypatch):
+    provider = LocalProvider(model_path="synthetic", enable_warmup=False)
+    provider._model = object()
+    provider._vlm_model = object()
+    provider._vlm_processor = object()
+    provider._vlm_config = {}
+
+    monkeypatch.setattr(provider, "_ensure_vlm_loaded", lambda: None)
+
+    captured = {}
+
+    def _fake_template(processor, config, messages, **kwargs):
+        captured["messages"] = messages
+        captured["kwargs"] = kwargs
+        return "vlm-prompt"
+
+    class _FakeResult:
+        text = "vision result"
+
+    def _fake_generate(model, processor, prompt, image=None, verbose=False, **kwargs):
+        captured["prompt"] = prompt
+        captured["image"] = image
+        captured["generate_kwargs"] = kwargs
+        return _FakeResult()
+
+    monkeypatch.setattr(local_mod, "vlm_apply_chat_template", _fake_template)
+    monkeypatch.setattr(local_mod, "vlm_generate", _fake_generate)
+
+    result = await provider.generate_messages(
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "请描述"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+yF9kAAAAASUVORK5CYII="}},
+            ],
+        }],
+        system="system prompt",
+        max_tokens=16,
+    )
+
+    assert result == "vision result"
+    assert captured["messages"][0] == {"role": "system", "content": "system prompt"}
+    assert captured["messages"][1]["content"] == "请描述"
+    assert captured["kwargs"]["num_images"] == 1
+    assert captured["prompt"] == "vlm-prompt"
+    assert len(captured["image"]) == 1
+    assert getattr(captured["image"][0], "size", None) == (1, 1)
+
+
+@pytest.mark.asyncio
+async def test_generate_messages_stream_uses_vlm_for_image_inputs(monkeypatch):
+    provider = LocalProvider(model_path="synthetic", enable_warmup=False)
+    provider._model = object()
+    provider._vlm_model = object()
+    provider._vlm_processor = object()
+    provider._vlm_config = {}
+
+    monkeypatch.setattr(provider, "_ensure_vlm_loaded", lambda: None)
+    monkeypatch.setattr(local_mod, "vlm_apply_chat_template", lambda processor, config, messages, **kwargs: "vlm-prompt")
+
+    class _Chunk:
+        def __init__(self, text):
+            self.text = text
+
+    monkeypatch.setattr(
+        local_mod,
+        "vlm_stream_generate",
+        lambda model, processor, prompt, image=None, **kwargs: [_Chunk("图"), _Chunk("像")],
+    )
+
+    chunks = []
+    async for token in provider.generate_messages_stream(
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "读图"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/demo.png"}},
+            ],
+        }],
+        system="system prompt",
+        max_tokens=16,
+    ):
+        chunks.append(token)
+
+    assert chunks == ["图", "像"]
+
+
 # ── Fix #7：finish_reason=length 时消费者收到 None 终止 ───────────────────────
 
 def _make_slot() -> _RequestSlot:

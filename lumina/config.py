@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional
 
+from lumina.config_runtime import resolve_config_path as resolve_runtime_config_path
 from lumina.platform_support.runtime import (
     DEFAULT_PROVIDER_TYPE,
     default_provider_model_path,
@@ -41,9 +42,36 @@ from lumina.platform_support.runtime import (
     resolve_provider_backend,
     resolve_whisper_model,
 )
+from lumina.ui_meta import HOME_TAB_KEYS, IMAGE_TASK_KEYS, LEGACY_HOME_TAB_MAP
 
 _CONFIG_PATH = Path(__file__).parent / "config.json"
 _DEFAULT_MODEL = default_provider_model_path(DEFAULT_PROVIDER_TYPE)
+_VALID_HOME_TABS = HOME_TAB_KEYS
+_DEFAULT_HOME_TABS = list(HOME_TAB_KEYS)
+_VALID_IMAGE_MODULES = IMAGE_TASK_KEYS
+_DEFAULT_IMAGE_MODULES = list(IMAGE_TASK_KEYS)
+
+
+def normalize_home_tabs(tabs: Optional[list[str]]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in tabs or []:
+        tab = LEGACY_HOME_TAB_MAP.get(str(raw).strip(), str(raw).strip())
+        if tab in _VALID_HOME_TABS and tab not in seen:
+            normalized.append(tab)
+            seen.add(tab)
+    return normalized
+
+
+def normalize_image_modules(modules: Optional[list[str]]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in modules or []:
+        mod = str(raw).strip()
+        if mod in _VALID_IMAGE_MODULES and mod not in seen:
+            normalized.append(mod)
+            seen.add(mod)
+    return normalized
 
 
 @dataclass
@@ -61,6 +89,11 @@ class PttConfig:
 
 
 @dataclass
+class DesktopConfig:
+    menubar_enabled: bool = True
+
+
+@dataclass
 class RequestHistoryConfig:
     enabled: bool = True
     capture_full_body: bool = True
@@ -68,6 +101,30 @@ class RequestHistoryConfig:
     max_total_mb: int = 512
     compress_after_days: int = 1
     cleanup_on_startup: bool = True
+
+
+@dataclass
+class UIHomeConfig:
+    enabled_tabs: list[str] = field(default_factory=lambda: list(_DEFAULT_HOME_TABS))
+    image_enabled: bool = True
+    image_modules: list[str] = field(default_factory=lambda: list(_DEFAULT_IMAGE_MODULES))
+    allow_local_override: bool = True
+
+    def __post_init__(self) -> None:
+        self.enabled_tabs = normalize_home_tabs(self.enabled_tabs) or list(_DEFAULT_HOME_TABS)
+        self.image_modules = normalize_image_modules(self.image_modules) or list(_DEFAULT_IMAGE_MODULES)
+
+
+@dataclass
+class UIConfig:
+    home: UIHomeConfig = field(default_factory=UIHomeConfig)
+
+
+@dataclass
+class MediaConfig:
+    ocr_model: str = "microsoft/trocr-base-printed"
+    caption_model: str = "Salesforce/blip-image-captioning-base"
+    max_image_mb: int = 12
 
 
 @dataclass
@@ -183,6 +240,14 @@ class Config:
             language=pt.get("language", "zh") or None,
         )
 
+        # ── Desktop ───────────────────────────────────────────────────────────
+        desktop = data.get("desktop", {})
+        if not isinstance(desktop, dict):
+            desktop = {}
+        self.desktop = DesktopConfig(
+            menubar_enabled=bool(desktop.get("menubar_enabled", True)),
+        )
+
         # ── Request History ───────────────────────────────────────────────────
         rh = data.get("request_history", {})
         if not isinstance(rh, dict):
@@ -196,22 +261,67 @@ class Config:
             cleanup_on_startup=bool(rh.get("cleanup_on_startup", True)),
         )
 
+        # ── Branding ──────────────────────────────────────────────────────────
+        branding = data.get("branding", {})
+        if not isinstance(branding, dict):
+            branding = {}
+        slogans = branding.get("slogans", [])
+        if not isinstance(slogans, list):
+            slogans = []
+        username = str(branding.get("username", "") or "").strip()
+        self.branding: Dict = {
+            "username": username,
+            "slogans": [str(s).strip() for s in slogans if str(s).strip()],
+        }
+
+        # ── UI ────────────────────────────────────────────────────────────────
+        ui = data.get("ui", {})
+        if not isinstance(ui, dict):
+            ui = {}
+        home = ui.get("home", {})
+        if not isinstance(home, dict):
+            home = {}
+        enabled_tabs = normalize_home_tabs(home.get("enabled_tabs", []))
+        image_modules = normalize_image_modules(home.get("image_modules", home.get("lab_modules", [])))
+        self.ui = UIConfig(
+            home=UIHomeConfig(
+                enabled_tabs=enabled_tabs or list(_DEFAULT_HOME_TABS),
+                image_enabled=bool(home.get("image_enabled", home.get("lab_enabled", True))),
+                image_modules=image_modules or list(_DEFAULT_IMAGE_MODULES),
+                allow_local_override=bool(home.get("allow_local_override", True)),
+            )
+        )
+
+        # ── Media ─────────────────────────────────────────────────────────────
+        media = data.get("media", {})
+        if not isinstance(media, dict):
+            media = {}
+        self.media = MediaConfig(
+            ocr_model=str(media.get("ocr_model", MediaConfig.ocr_model)),
+            caption_model=str(media.get("caption_model", MediaConfig.caption_model)),
+            max_image_mb=max(1, int(media.get("max_image_mb", MediaConfig.max_image_mb))),
+        )
+
 
 # 全局单例
 _instance: Optional[Config] = None
+_instance_source_path: Optional[str] = None
 
 
 def get_config(path: Optional[str] = None) -> Config:
-    global _instance
-    if _instance is None:
-        _instance = Config(path)
+    global _instance, _instance_source_path
+    resolved_path = resolve_runtime_config_path(path)
+    if _instance is None or (path is not None and resolved_path != _instance_source_path):
+        _instance = Config(resolved_path)
+        _instance_source_path = resolved_path
     return _instance
 
 
 def reset_config() -> None:
     """重置全局配置单例，下次 get_config() 调用时重新加载。测试用。"""
-    global _instance
+    global _instance, _instance_source_path
     _instance = None
+    _instance_source_path = None
 
 
 # ── Lumina 数据目录路径常量 ────────────────────────────────────────────────

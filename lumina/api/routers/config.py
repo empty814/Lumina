@@ -2,17 +2,21 @@
 lumina/api/routers/config.py — 配置读取与更新接口
 
 GET  /v1/config  — 返回当前运行时配置（合并 config.json + 环境变量后的值）
-PATCH /v1/config — 部分更新配置，写回 ~/.lumina/config.json；可热重载字段立即生效
+PATCH /v1/config — 部分更新配置，写回当前活动配置文件；可热重载字段立即生效
 """
 import asyncio
-import json
 import logging
-import uuid
-from pathlib import Path
 from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
+
+from lumina.config_runtime import (
+    read_mutable_config_data,
+    serialize_runtime_config,
+    update_runtime_config,
+    write_config_atomic,
+)
 
 logger = logging.getLogger("lumina")
 
@@ -20,11 +24,6 @@ router = APIRouter(tags=["config"])
 
 # 防止并发写
 _write_lock = asyncio.Lock()
-
-# 用户配置文件路径（与 cli/utils.py 一致）
-_USER_CONFIG_PATH = Path.home() / ".lumina" / "config.json"
-_PKG_CONFIG_PATH = Path(__file__).parent.parent.parent / "config.py"
-
 
 # ── Pydantic 请求体 ────────────────────────────────────────────────────────────
 
@@ -69,6 +68,10 @@ class PttPatch(BaseModel):
     language: Optional[str] = None
 
 
+class DesktopPatch(BaseModel):
+    menubar_enabled: Optional[bool] = None
+
+
 class RequestHistoryPatch(BaseModel):
     enabled: Optional[bool] = None
     capture_full_body: Optional[bool] = None
@@ -76,6 +79,21 @@ class RequestHistoryPatch(BaseModel):
     max_total_mb: Optional[int] = None
     compress_after_days: Optional[int] = None
     cleanup_on_startup: Optional[bool] = None
+
+
+class BrandingPatch(BaseModel):
+    username: Optional[str] = None
+
+
+class UIHomePatch(BaseModel):
+    enabled_tabs: Optional[List[str]] = None
+    image_enabled: Optional[bool] = None
+    image_modules: Optional[List[str]] = None
+    allow_local_override: Optional[bool] = None
+
+
+class UIPatch(BaseModel):
+    home: Optional[UIHomePatch] = None
 
 
 class ConfigPatch(BaseModel):
@@ -86,57 +104,11 @@ class ConfigPatch(BaseModel):
     log_level: Optional[str] = None
     digest: Optional[DigestPatch] = None
     ptt: Optional[PttPatch] = None
+    desktop: Optional[DesktopPatch] = None
     request_history: Optional[RequestHistoryPatch] = None
+    branding: Optional[BrandingPatch] = None
+    ui: Optional[UIPatch] = None
     system_prompts: Optional[Dict[str, str]] = None
-
-
-# ── 辅助 ──────────────────────────────────────────────────────────────────────
-
-def _read_user_config() -> dict:
-    """读取 ~/.lumina/config.json，不存在则读取包内 config.json。"""
-    if _USER_CONFIG_PATH.exists():
-        with open(_USER_CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    pkg = Path(__file__).parent.parent.parent / "config.json"
-    if pkg.exists():
-        with open(pkg, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-
-def _write_user_config_atomic(data: dict) -> None:
-    """原子写回 ~/.lumina/config.json（临时文件 + rename）。"""
-    _USER_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = _USER_CONFIG_PATH.with_name(f"config.{uuid.uuid4().hex[:8]}.tmp")
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        tmp.replace(_USER_CONFIG_PATH)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
-
-
-def _deep_set(base: dict, override: dict) -> dict:
-    """深度合并：override 存在的 key 覆盖 base，不删除 base 其余 key。"""
-    result = dict(base)
-    for k, v in override.items():
-        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
-            result[k] = _deep_set(result[k], v)
-        else:
-            result[k] = v
-    return result
-
-
-def _public_system_prompts(prompts: Optional[Dict[str, str]]) -> Dict[str, str]:
-    """过滤用户可见的 prompt key，隐藏 _readme 这类内部字段。"""
-    if not isinstance(prompts, dict):
-        return {}
-    return {
-        str(k): str(v)
-        for k, v in prompts.items()
-        if isinstance(k, str) and not k.startswith("_")
-    }
 
 
 # ── 路由 ──────────────────────────────────────────────────────────────────────
@@ -145,61 +117,7 @@ def _public_system_prompts(prompts: Optional[Dict[str, str]]) -> Dict[str, str]:
 async def get_config_api():
     """返回当前运行时配置（含环境变量覆盖后的值）。"""
     from lumina.config import get_config
-    cfg = get_config()
-    return {
-        "provider": {
-            "type": cfg.provider.type,
-            "backend": cfg.provider.backend,
-            "model_path": cfg.provider.model_path,
-            "sampling": {
-                "temperature": cfg.provider.sampling.temperature,
-                "top_p": cfg.provider.sampling.top_p,
-                "top_k": cfg.provider.sampling.top_k,
-                "min_p": cfg.provider.sampling.min_p,
-                "presence_penalty": cfg.provider.sampling.presence_penalty,
-                "repetition_penalty": cfg.provider.sampling.repetition_penalty,
-                "max_tokens": cfg.provider.sampling.max_tokens,
-            },
-            "openai": {
-                "base_url": cfg.provider.openai.base_url,
-                "api_key": cfg.provider.openai.api_key,
-                "model": cfg.provider.openai.model,
-            },
-            "llama_cpp": {
-                "model_path": cfg.provider.llama_cpp.model_path,
-                "n_gpu_layers": cfg.provider.llama_cpp.n_gpu_layers,
-                "n_ctx": cfg.provider.llama_cpp.n_ctx,
-            },
-        },
-        "whisper_model": cfg.whisper_model,
-        "host": cfg.host,
-        "port": cfg.port,
-        "log_level": cfg.log_level,
-        "digest": {
-            "enabled": cfg.digest.get("enabled", False) if isinstance(cfg.digest, dict) else False,
-            "scan_dirs": cfg.digest.get("scan_dirs", []) if isinstance(cfg.digest, dict) else [],
-            "history_hours": cfg.digest.get("history_hours", 24) if isinstance(cfg.digest, dict) else 24,
-            "refresh_hours": cfg.digest.get("refresh_hours", 1) if isinstance(cfg.digest, dict) else 1,
-            "notify_time": cfg.digest.get("notify_time", "20:00") if isinstance(cfg.digest, dict) else "20:00",
-            "enabled_collectors": cfg.digest.get("enabled_collectors") if isinstance(cfg.digest, dict) else None,
-            "weekly_report_day": cfg.digest.get("weekly_report_day", 0) if isinstance(cfg.digest, dict) else 0,
-            "monthly_report_day": cfg.digest.get("monthly_report_day", 1) if isinstance(cfg.digest, dict) else 1,
-        },
-        "ptt": {
-            "enabled": cfg.ptt.enabled,
-            "hotkey": cfg.ptt.hotkey,
-            "language": cfg.ptt.language,
-        },
-        "request_history": {
-            "enabled": cfg.request_history.enabled,
-            "capture_full_body": cfg.request_history.capture_full_body,
-            "retention_days": cfg.request_history.retention_days,
-            "max_total_mb": cfg.request_history.max_total_mb,
-            "compress_after_days": cfg.request_history.compress_after_days,
-            "cleanup_on_startup": cfg.request_history.cleanup_on_startup,
-        },
-        "system_prompts": _public_system_prompts(cfg.system_prompts),
-    }
+    return serialize_runtime_config(get_config())
 
 
 @router.patch("/v1/config")
@@ -208,13 +126,13 @@ async def patch_config_api(patch: ConfigPatch, request: Request):
     部分更新配置，写回 ~/.lumina/config.json。
 
     可热重载（立即生效）：digest、system_prompts
-    需要重启：provider、whisper_model、host、port、log_level、ptt
+    需要重启：provider、whisper_model、host、port、log_level、desktop
       （ptt 通过文件 mtime 监听，约 1s 内自动重载）
     """
     restart_required = False
 
     async with _write_lock:
-        data = await asyncio.to_thread(_read_user_config)
+        data = await asyncio.to_thread(read_mutable_config_data)
 
         # ── provider ─────────────────────────────────────────────────────────
         if patch.provider is not None:
@@ -321,6 +239,15 @@ async def patch_config_api(patch: ConfigPatch, request: Request):
             data["ptt"] = pc
             # PTT 通过文件 mtime watcher 自动重载，不需要标 restart_required
 
+        if patch.desktop is not None:
+            desktop = data.get("desktop", {})
+            if not isinstance(desktop, dict):
+                desktop = {}
+            if patch.desktop.menubar_enabled is not None:
+                desktop["menubar_enabled"] = patch.desktop.menubar_enabled
+                restart_required = True
+            data["desktop"] = desktop
+
         # ── request_history ────────────────────────────────────────────────────
         if patch.request_history is not None:
             rh = patch.request_history
@@ -341,6 +268,38 @@ async def patch_config_api(patch: ConfigPatch, request: Request):
                 rc["cleanup_on_startup"] = rh.cleanup_on_startup
             data["request_history"] = rc
 
+        # ── branding ───────────────────────────────────────────────────────────
+        if patch.branding is not None:
+            branding = data.get("branding", {})
+            if not isinstance(branding, dict):
+                branding = {}
+            if patch.branding.username is not None:
+                branding["username"] = patch.branding.username.strip()
+            data["branding"] = branding
+
+        # ── ui ────────────────────────────────────────────────────────────────
+        if patch.ui is not None and patch.ui.home is not None:
+            ui = data.get("ui", {})
+            if not isinstance(ui, dict):
+                ui = {}
+            home = ui.get("home", {})
+            if not isinstance(home, dict):
+                home = {}
+            if patch.ui.home.enabled_tabs is not None:
+                from lumina.config import normalize_home_tabs
+
+                home["enabled_tabs"] = normalize_home_tabs(patch.ui.home.enabled_tabs)
+            if patch.ui.home.image_enabled is not None:
+                home["image_enabled"] = patch.ui.home.image_enabled
+            if patch.ui.home.image_modules is not None:
+                from lumina.config import normalize_image_modules
+
+                home["image_modules"] = normalize_image_modules(patch.ui.home.image_modules)
+            if patch.ui.home.allow_local_override is not None:
+                home["allow_local_override"] = patch.ui.home.allow_local_override
+            ui["home"] = home
+            data["ui"] = ui
+
         # ── system_prompts ────────────────────────────────────────────────────
         if patch.system_prompts is not None:
             sp = data.get("system_prompts", {})
@@ -349,15 +308,22 @@ async def patch_config_api(patch: ConfigPatch, request: Request):
             sp.update(patch.system_prompts)
             data["system_prompts"] = sp
 
-        await asyncio.to_thread(_write_user_config_atomic, data)
+        await asyncio.to_thread(write_config_atomic, data)
 
     # ── 热重载 ────────────────────────────────────────────────────────────────
+    from lumina.config import get_config
+
+    cfg = get_config()
 
     # digest：重新初始化 DigestConfig 单例
     if patch.digest is not None:
         try:
             from lumina.digest.config import configure as _digest_configure
             _digest_configure(data)
+            update_runtime_config(cfg, data, sections={"digest"})
+            scheduler = getattr(request.app.state, "digest_scheduler", None)
+            if scheduler is not None:
+                scheduler.reload(run_startup=True)
             logger.info("Config: digest config hot-reloaded")
         except Exception as e:
             logger.warning("Config: digest hot-reload failed: %s", e)
@@ -366,9 +332,7 @@ async def patch_config_api(patch: ConfigPatch, request: Request):
     if patch.system_prompts is not None:
         try:
             from lumina.asr.transcriber import set_asr_prompts as _set_asr_prompts
-            from lumina.config import get_config
 
-            cfg = get_config()
             llm = request.app.state.llm
             llm._system_prompts.update(patch.system_prompts)
             cfg.system_prompts.update(patch.system_prompts)
@@ -383,18 +347,7 @@ async def patch_config_api(patch: ConfigPatch, request: Request):
     # provider.sampling：热重载 config singleton 中的 sampling 字段
     if patch.provider is not None and patch.provider.sampling is not None:
         try:
-            from lumina.config import SamplingConfig, get_config
-            cfg = get_config()
-            sc_data = data.get("provider", {}).get("sampling", {})
-            cfg.provider.sampling = SamplingConfig(
-                temperature=float(sc_data["temperature"]) if "temperature" in sc_data else None,
-                top_p=float(sc_data["top_p"]) if "top_p" in sc_data else None,
-                top_k=int(sc_data["top_k"]) if "top_k" in sc_data else None,
-                min_p=float(sc_data["min_p"]) if "min_p" in sc_data else None,
-                presence_penalty=float(sc_data["presence_penalty"]) if "presence_penalty" in sc_data else None,
-                repetition_penalty=float(sc_data["repetition_penalty"]) if "repetition_penalty" in sc_data else None,
-                max_tokens=int(sc_data["max_tokens"]) if "max_tokens" in sc_data else None,
-            )
+            update_runtime_config(cfg, data, sections={"provider_sampling"})
             logger.info("Config: provider.sampling hot-reloaded")
         except Exception as e:
             logger.warning("Config: provider.sampling hot-reload failed: %s", e)
@@ -402,32 +355,33 @@ async def patch_config_api(patch: ConfigPatch, request: Request):
     if patch.request_history is not None:
         try:
             from lumina import request_history as _request_history
-            from lumina.config import get_config
 
             _request_history.configure({"request_history": data.get("request_history", {})})
-            cfg = get_config()
-            cfg.request_history.enabled = bool(data["request_history"].get("enabled", True))
-            cfg.request_history.capture_full_body = bool(
-                data["request_history"].get("capture_full_body", True)
-            )
-            cfg.request_history.retention_days = max(
-                0,
-                int(data["request_history"].get("retention_days", 14)),
-            )
-            cfg.request_history.max_total_mb = max(
-                1,
-                int(data["request_history"].get("max_total_mb", 512)),
-            )
-            cfg.request_history.compress_after_days = max(
-                0,
-                int(data["request_history"].get("compress_after_days", 1)),
-            )
-            cfg.request_history.cleanup_on_startup = bool(
-                data["request_history"].get("cleanup_on_startup", True)
-            )
+            update_runtime_config(cfg, data, sections={"request_history"})
             logger.info("Config: request_history hot-reloaded")
         except Exception as e:
             logger.warning("Config: request_history hot-reload failed: %s", e)
+
+    if patch.branding is not None:
+        try:
+            update_runtime_config(cfg, data, sections={"branding"})
+            logger.info("Config: branding hot-reloaded")
+        except Exception as e:
+            logger.warning("Config: branding hot-reload failed: %s", e)
+
+    if patch.ui is not None and patch.ui.home is not None:
+        try:
+            update_runtime_config(cfg, data, sections={"ui"})
+            logger.info("Config: ui.home hot-reloaded")
+        except Exception as e:
+            logger.warning("Config: ui.home hot-reload failed: %s", e)
+
+    if patch.desktop is not None:
+        try:
+            update_runtime_config(cfg, data, sections={"desktop"})
+            logger.info("Config: desktop hot-reloaded")
+        except Exception as e:
+            logger.warning("Config: desktop hot-reload failed: %s", e)
 
     return {"ok": True, "restart_required": restart_required}
 

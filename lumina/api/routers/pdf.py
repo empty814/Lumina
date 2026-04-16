@@ -9,10 +9,10 @@ import json
 import tempfile
 from pathlib import Path
 
-import markdown as md
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 
+from lumina.api.rendering import render_markdown_html
 from lumina.api.protocol import PdfUrlRequest
 from lumina.services.pdf import (
     cleanup_after,
@@ -148,7 +148,7 @@ async def pdf_summarize_sync(file: UploadFile = File(...), raw: Request = None):
         import shutil
         asyncio.ensure_future(asyncio.to_thread(shutil.rmtree, tmp_dir, True))
     full_text = "".join(tokens)
-    html_content = md.markdown(full_text, extensions=["fenced_code", "tables"])
+    html_content = render_markdown_html(full_text)
     return HTMLResponse(f'<div class="result-text digest-item-body">{html_content}</div>')
 
 
@@ -180,7 +180,7 @@ async def pdf_url_summarize_sync(body: PdfUrlRequest, raw: Request):
         except (json.JSONDecodeError, KeyError):
             pass
     full_text = "".join(tokens)
-    html_content = md.markdown(full_text, extensions=["fenced_code", "tables"])
+    html_content = render_markdown_html(full_text)
     return HTMLResponse(f'<div class="result-text digest-item-body">{html_content}</div>')
 
 

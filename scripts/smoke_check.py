@@ -17,14 +17,14 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 
 TEST_TARGETS = [
-    "tests/test_server_api.py",
-    "tests/test_digest.py",
-    "tests/unit/test_config.py",
-    "tests/unit/test_config_router.py",
-    "tests/unit/test_platform_support.py",
-    "tests/unit/test_popup.py",
-    "tests/unit/test_provider_resolution.py",
-    "tests/unit/test_lumina_file_action.py",
+    "tests/api/test_server_api.py",
+    "tests/digest/test_digest.py",
+    "tests/cli/test_config.py",
+    "tests/api/test_config_router.py",
+    "tests/providers/test_platform_support.py",
+    "tests/cli/test_popup.py",
+    "tests/providers/test_provider_resolution.py",
+    "tests/cli/test_lumina_file_action.py",
 ]
 
 RUFF_TARGETS = [

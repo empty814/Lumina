@@ -46,6 +46,8 @@ Continuous Batching 工作原理（_legacy_scheduler 路径）
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -62,7 +64,7 @@ except ImportError:
     _MLX_AVAILABLE = False
 
 from lumina.engine.scheduler import GenerationRequest
-from .base import BaseProvider
+from .base import BaseProvider, ProviderCapabilities
 from .mlx_loader import MlxModelLoader
 from .mlx_prompt import MlxPromptBuilder
 from .system_prompt_cache import SystemPromptCache, SystemPromptCacheEntry
@@ -75,6 +77,21 @@ from lumina.sampling import (
     DEFAULT_TOP_P,
     build_mlx_sampler,
 )
+
+try:
+    from mlx_vlm import generate as vlm_generate
+    from mlx_vlm import load as vlm_load
+    from mlx_vlm.generate import stream_generate as vlm_stream_generate
+    from mlx_vlm.prompt_utils import apply_chat_template as vlm_apply_chat_template
+    from mlx_vlm.utils import load_config as vlm_load_config
+    _MLX_VLM_AVAILABLE = True
+except ImportError:
+    vlm_generate = None  # type: ignore[assignment]
+    vlm_load = None  # type: ignore[assignment]
+    vlm_stream_generate = None  # type: ignore[assignment]
+    vlm_apply_chat_template = None  # type: ignore[assignment]
+    vlm_load_config = None  # type: ignore[assignment]
+    _MLX_VLM_AVAILABLE = False
 
 # 每次迭代最多接入的新 prefill 请求数。
 # 取 4 可以更快吸收一小波同时到达的短请求，降低后到请求的排队 TTFT。
@@ -114,6 +131,10 @@ class _RequestSlot(GenerationRequest):
 
 
 class LocalProvider(BaseProvider):
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(supports_image_input=_MLX_VLM_AVAILABLE)
+
     def __init__(
         self,
         model_path: str,
@@ -145,6 +166,10 @@ class LocalProvider(BaseProvider):
         self._legacy_executor: Optional[ThreadPoolExecutor] = None
         self._spc: Optional[SystemPromptCache] = None
         self._prompt_builder: Optional[MlxPromptBuilder] = None
+        self._vlm_model = None
+        self._vlm_processor = None
+        self._vlm_config = None
+        self._vlm_lock = threading.Lock()
         self._loader = MlxModelLoader(
             model_path=model_path,
             max_new_prefill_per_iter=self.max_new_prefill_per_iter,
@@ -672,6 +697,158 @@ class LocalProvider(BaseProvider):
     # Layer 5 — 公共接口
     # ══════════════════════════════════════════════════════════════════════════
 
+    @staticmethod
+    def _messages_include_images(messages: list[dict[str, Any]]) -> bool:
+        for message in messages:
+            content = message.get("content", "")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    return True
+        return False
+
+    @staticmethod
+    def _decode_data_url_image(image_ref: str):
+        try:
+            from PIL import Image
+        except ImportError as exc:
+            raise RuntimeError("Pillow 未安装，无法解析图片输入") from exc
+
+        try:
+            _, payload = image_ref.split(",", 1)
+        except ValueError as exc:
+            raise ValueError("无效的 data URL 图片输入") from exc
+        try:
+            image_bytes = base64.b64decode(payload)
+        except Exception as exc:
+            raise ValueError("无法解码 data URL 图片内容") from exc
+        return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+    @classmethod
+    def _normalize_vlm_image_input(cls, image_ref: str):
+        image_ref = (image_ref or "").strip()
+        if not image_ref:
+            raise ValueError("图片输入为空")
+        if image_ref.startswith("data:"):
+            return cls._decode_data_url_image(image_ref)
+        if image_ref.startswith("file://"):
+            return image_ref[len("file://"):]
+        return image_ref
+
+    def _build_vlm_messages_and_images(
+        self,
+        messages: list[dict[str, Any]],
+        system: Optional[str],
+    ) -> tuple[list[dict[str, str]], list[Any]]:
+        vlm_messages: list[dict[str, str]] = []
+        image_inputs: list[Any] = []
+        if system:
+            vlm_messages.append({"role": "system", "content": system})
+        for message in messages:
+            role = str(message.get("role", "user"))
+            content = message.get("content", "")
+            if isinstance(content, str):
+                vlm_messages.append({"role": role, "content": content})
+                continue
+            if not isinstance(content, list):
+                raise TypeError("消息 content 格式不支持")
+            text_parts: list[str] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                part_type = part.get("type")
+                if part_type == "text":
+                    text = str(part.get("text", "")).strip()
+                    if text:
+                        text_parts.append(text)
+                    continue
+                if part_type == "image_url":
+                    image_url = part.get("image_url") or {}
+                    image_ref = str(image_url.get("url", "")).strip()
+                    image_inputs.append(self._normalize_vlm_image_input(image_ref))
+                    continue
+                raise ValueError(f"不支持的消息内容类型：{part_type}")
+            vlm_messages.append({"role": role, "content": "\n".join(text_parts).strip()})
+        if not image_inputs:
+            raise ValueError("未找到图片输入")
+        return vlm_messages, image_inputs
+
+    def _ensure_vlm_loaded(self) -> None:
+        if self._vlm_model is not None and self._vlm_processor is not None and self._vlm_config is not None:
+            return
+        if not _MLX_VLM_AVAILABLE:
+            raise ImportError("mlx-vlm 未安装，无法使用本地视觉模型")
+        with self._vlm_lock:
+            if self._vlm_model is not None and self._vlm_processor is not None and self._vlm_config is not None:
+                return
+            load_target = self._loader.resolve_target()
+            self._vlm_model, self._vlm_processor = vlm_load(load_target)
+            self._vlm_config = vlm_load_config(load_target)
+
+    def _prepare_vlm_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        system: Optional[str],
+    ) -> tuple[str, list[Any]]:
+        self._ensure_vlm_loaded()
+        vlm_messages, image_inputs = self._build_vlm_messages_and_images(messages, system)
+        prompt = vlm_apply_chat_template(
+            self._vlm_processor,
+            self._vlm_config,
+            vlm_messages,
+            add_generation_prompt=True,
+            enable_thinking=False,
+            num_images=len(image_inputs),
+        )
+        return prompt, image_inputs
+
+    def _generate_vlm_text(
+        self,
+        messages: list[dict[str, Any]],
+        system: Optional[str],
+        *,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        repetition_penalty: float,
+    ) -> str:
+        prompt, image_inputs = self._prepare_vlm_prompt(messages, system)
+        result = vlm_generate(
+            self._vlm_model,
+            self._vlm_processor,
+            prompt,
+            image=image_inputs,
+            verbose=False,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+        )
+        return str(getattr(result, "text", result or "")).strip()
+
+    def _stream_vlm_responses(
+        self,
+        messages: list[dict[str, Any]],
+        system: Optional[str],
+        *,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        repetition_penalty: float,
+    ):
+        prompt, image_inputs = self._prepare_vlm_prompt(messages, system)
+        return vlm_stream_generate(
+            self._vlm_model,
+            self._vlm_processor,
+            prompt,
+            image=image_inputs,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+        )
+
     async def generate_stream(
         self,
         user_text: str,
@@ -721,3 +898,104 @@ class LocalProvider(BaseProvider):
                 yield item
         finally:
             slot.done = True
+
+    async def generate_messages_stream(
+        self,
+        messages: list[dict[str, Any]],
+        system: Optional[str],
+        max_tokens: int,
+        temperature: float = DEFAULT_TEMPERATURE,
+        top_p: float = DEFAULT_TOP_P,
+        *,
+        top_k: int = DEFAULT_TOP_K,
+        min_p: float = DEFAULT_MIN_P,
+        presence_penalty: float = DEFAULT_PRESENCE_PENALTY,
+        repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
+    ) -> AsyncIterator[str]:
+        if not self._messages_include_images(messages):
+            async for token in super().generate_messages_stream(
+                messages,
+                system,
+                max_tokens,
+                temperature,
+                top_p,
+                top_k=top_k,
+                min_p=min_p,
+                presence_penalty=presence_penalty,
+                repetition_penalty=repetition_penalty,
+            ):
+                yield token
+            return
+
+        if not self.is_ready:
+            raise RuntimeError("LocalProvider not loaded. Call load() first.")
+
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+
+        def _run():
+            try:
+                for response in self._stream_vlm_responses(
+                    messages,
+                    system,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                ):
+                    text = str(getattr(response, "text", response or ""))
+                    if text:
+                        loop.call_soon_threadsafe(queue.put_nowait, text)
+            except Exception as exc:
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
+
+    async def generate_messages(
+        self,
+        messages: list[dict[str, Any]],
+        system: Optional[str],
+        max_tokens: int,
+        temperature: float = DEFAULT_TEMPERATURE,
+        top_p: float = DEFAULT_TOP_P,
+        *,
+        top_k: int = DEFAULT_TOP_K,
+        min_p: float = DEFAULT_MIN_P,
+        presence_penalty: float = DEFAULT_PRESENCE_PENALTY,
+        repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
+    ) -> str:
+        if not self._messages_include_images(messages):
+            return await super().generate_messages(
+                messages,
+                system,
+                max_tokens,
+                temperature,
+                top_p,
+                top_k=top_k,
+                min_p=min_p,
+                presence_penalty=presence_penalty,
+                repetition_penalty=repetition_penalty,
+            )
+
+        if not self.is_ready:
+            raise RuntimeError("LocalProvider not loaded. Call load() first.")
+
+        return await asyncio.to_thread(
+            self._generate_vlm_text,
+            messages,
+            system,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+        )

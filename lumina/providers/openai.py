@@ -7,11 +7,11 @@ OpenAIProvider：将请求转发到任意 OpenAI 兼容的 HTTP API。
   - 其他 Lumina 实例（级联）
 """
 import json
-from typing import AsyncIterator, Optional
+from typing import Any, AsyncIterator, Optional
 
 import aiohttp
 
-from .base import BaseProvider
+from .base import BaseProvider, ProviderCapabilities
 from lumina.sampling import (
     DEFAULT_MIN_P,
     DEFAULT_PRESENCE_PENALTY,
@@ -23,6 +23,10 @@ from lumina.sampling import (
 
 
 class OpenAIProvider(BaseProvider):
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(supports_image_input=True)
+
     def __init__(
         self,
         base_url: str,
@@ -62,6 +66,37 @@ class OpenAIProvider(BaseProvider):
         return {
             "model": self.model,
             "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "min_p": min_p,
+            "presence_penalty": presence_penalty,
+            "repetition_penalty": repetition_penalty,
+            "stream": stream,
+        }
+
+    def _payload_messages(
+        self,
+        messages: list[dict[str, Any]],
+        system: Optional[str],
+        max_tokens: int,
+        stream: bool,
+        temperature: float = DEFAULT_TEMPERATURE,
+        top_p: float = DEFAULT_TOP_P,
+        *,
+        top_k: int = DEFAULT_TOP_K,
+        min_p: float = DEFAULT_MIN_P,
+        presence_penalty: float = DEFAULT_PRESENCE_PENALTY,
+        repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
+    ) -> dict:
+        merged_messages: list[dict[str, Any]] = []
+        if system:
+            merged_messages.append({"role": "system", "content": system})
+        merged_messages.extend(messages)
+        return {
+            "model": self.model,
+            "messages": merged_messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
             "top_p": top_p,
@@ -137,6 +172,89 @@ class OpenAIProvider(BaseProvider):
     ) -> str:
         payload = self._payload(
             user_text,
+            system,
+            max_tokens,
+            stream=False,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            presence_penalty=presence_penalty,
+            repetition_penalty=repetition_penalty,
+        )
+        url = f"{self.base_url}/chat/completions"
+
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            async with session.post(url, headers=self._headers(), json=payload) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+                return data["choices"][0]["message"]["content"]
+
+    async def generate_messages_stream(
+        self,
+        messages: list[dict[str, Any]],
+        system: Optional[str],
+        max_tokens: int,
+        temperature: float = DEFAULT_TEMPERATURE,
+        top_p: float = DEFAULT_TOP_P,
+        *,
+        top_k: int = DEFAULT_TOP_K,
+        min_p: float = DEFAULT_MIN_P,
+        presence_penalty: float = DEFAULT_PRESENCE_PENALTY,
+        repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
+    ) -> AsyncIterator[str]:
+        payload = self._payload_messages(
+            messages,
+            system,
+            max_tokens,
+            stream=True,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            presence_penalty=presence_penalty,
+            repetition_penalty=repetition_penalty,
+        )
+        url = f"{self.base_url}/chat/completions"
+
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            async with session.post(url, headers=self._headers(), json=payload) as resp:
+                resp.raise_for_status()
+                buf = ""
+                async for chunk in resp.content.iter_any():
+                    buf += chunk.decode(errors="replace")
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        line = line.strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[len("data:"):].strip()
+                        if data == "[DONE]":
+                            return
+                        try:
+                            obj = json.loads(data)
+                            delta = obj["choices"][0]["delta"]
+                            content = delta.get("content")
+                            if content:
+                                yield content
+                        except (json.JSONDecodeError, KeyError, IndexError):
+                            continue
+
+    async def generate_messages(
+        self,
+        messages: list[dict[str, Any]],
+        system: Optional[str],
+        max_tokens: int,
+        temperature: float = DEFAULT_TEMPERATURE,
+        top_p: float = DEFAULT_TOP_P,
+        *,
+        top_k: int = DEFAULT_TOP_K,
+        min_p: float = DEFAULT_MIN_P,
+        presence_penalty: float = DEFAULT_PRESENCE_PENALTY,
+        repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
+    ) -> str:
+        payload = self._payload_messages(
+            messages,
             system,
             max_tokens,
             stream=False,

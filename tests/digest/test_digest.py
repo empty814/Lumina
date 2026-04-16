@@ -506,3 +506,142 @@ def test_collector_protocol_satisfied():
 
     for fn in COLLECTORS:
         assert isinstance(fn, Collector), f"{fn.__name__} does not satisfy Collector protocol"
+
+
+def test_find_missing_daily_report_keys_uses_snapshot_gaps(tmp_path, monkeypatch):
+    import lumina.digest.reports as reports
+
+    monkeypatch.setattr(reports, "DIGEST_SNAPSHOTS_DIR", tmp_path / "snapshots")
+    monkeypatch.setattr(reports, "REPORTS_DAILY_DIR", tmp_path / "reports" / "daily")
+    monkeypatch.setattr(reports, "REPORTS_WEEKLY_DIR", tmp_path / "reports" / "weekly")
+    monkeypatch.setattr(reports, "REPORTS_MONTHLY_DIR", tmp_path / "reports" / "monthly")
+
+    reports.save_snapshot("snapshot-1", datetime(2026, 4, 10, 9, 0))
+    reports.save_snapshot("snapshot-2", datetime(2026, 4, 11, 10, 0))
+    reports.save_snapshot("snapshot-3", datetime(2026, 4, 12, 11, 0))
+    reports.save_report("daily", "2026-04-10", "done")
+
+    missing_before_notify = reports.find_missing_daily_report_keys(
+        now=datetime(2026, 4, 12, 19, 0),
+        notify_time="20:00",
+    )
+    missing_after_notify = reports.find_missing_daily_report_keys(
+        now=datetime(2026, 4, 12, 21, 0),
+        notify_time="20:00",
+    )
+
+    assert missing_before_notify == ["2026-04-11"]
+    assert missing_after_notify == ["2026-04-11", "2026-04-12"]
+
+
+def test_find_missing_weekly_and_monthly_report_keys_skip_current_period(tmp_path, monkeypatch):
+    import lumina.digest.reports as reports
+
+    monkeypatch.setattr(reports, "DIGEST_SNAPSHOTS_DIR", tmp_path / "snapshots")
+    monkeypatch.setattr(reports, "REPORTS_DAILY_DIR", tmp_path / "reports" / "daily")
+    monkeypatch.setattr(reports, "REPORTS_WEEKLY_DIR", tmp_path / "reports" / "weekly")
+    monkeypatch.setattr(reports, "REPORTS_MONTHLY_DIR", tmp_path / "reports" / "monthly")
+
+    reports.save_report("daily", "2026-03-30", "daily-1")
+    reports.save_report("daily", "2026-04-08", "daily-2")
+    reports.save_report("daily", "2026-05-06", "daily-3")
+    reports.save_report("weekly", reports.weekly_key(datetime(2026, 3, 30).date()), "weekly-1")
+    reports.save_report("monthly", "2026-03", "monthly-1")
+
+    missing_weekly = reports.find_missing_weekly_report_keys(today=datetime(2026, 5, 10).date())
+    missing_monthly = reports.find_missing_monthly_report_keys(today=datetime(2026, 5, 10).date())
+
+    assert missing_weekly == [reports.weekly_key(datetime(2026, 4, 8).date())]
+    assert missing_monthly == ["2026-04"]
+
+
+@pytest.mark.asyncio
+async def test_startup_backfill_reports_fills_historical_gaps(tmp_path, monkeypatch):
+    import lumina.cli.server as server
+    import lumina.cli.utils as cli_utils
+    import lumina.digest as digest
+    import lumina.digest.reports as reports
+    from lumina.digest.config import configure
+
+    monkeypatch.setattr(reports, "DIGEST_SNAPSHOTS_DIR", tmp_path / "snapshots")
+    monkeypatch.setattr(reports, "REPORTS_DAILY_DIR", tmp_path / "reports" / "daily")
+    monkeypatch.setattr(reports, "REPORTS_WEEKLY_DIR", tmp_path / "reports" / "weekly")
+    monkeypatch.setattr(reports, "REPORTS_MONTHLY_DIR", tmp_path / "reports" / "monthly")
+
+    reports.save_snapshot("snapshot-1", datetime(2026, 4, 1, 9, 0))
+    reports.save_snapshot("snapshot-2", datetime(2026, 4, 8, 9, 0))
+
+    calls = []
+
+    async def fake_generate_report(_llm, report_type, key):
+        calls.append((report_type, key))
+        reports.save_report(report_type, key, f"{report_type}:{key}")
+        return f"{report_type}:{key}"
+
+    configure({"digest": {"enabled": True, "notify_time": "20:00"}})
+    monkeypatch.setattr(cli_utils, "is_digest_enabled", lambda: True)
+    monkeypatch.setattr(digest, "generate_report", fake_generate_report)
+
+    try:
+        await server._maybe_backfill_reports(object(), now=datetime(2026, 5, 10, 21, 0))
+    finally:
+        configure({"digest": {}})
+
+    assert calls == [
+        ("daily", "2026-04-01"),
+        ("daily", "2026-04-08"),
+        ("weekly", reports.weekly_key(datetime(2026, 4, 1).date())),
+        ("weekly", reports.weekly_key(datetime(2026, 4, 8).date())),
+        ("monthly", "2026-04"),
+    ]
+
+
+def test_digest_scheduler_reload_cancels_and_reschedules(monkeypatch):
+    from lumina.digest.config import configure
+    from lumina.digest.scheduler import DigestScheduler
+
+    created_timers = []
+    startup_calls = []
+
+    class FakeTimer:
+        def __init__(self, delay, callback):
+            self.delay = delay
+            self.callback = callback
+            self.cancelled = False
+            self.started = False
+            created_timers.append(self)
+
+        def start(self):
+            self.started = True
+
+        def cancel(self):
+            self.cancelled = True
+
+    monkeypatch.setattr("lumina.digest.scheduler.threading.Timer", FakeTimer)
+    monkeypatch.setattr(DigestScheduler, "_seconds_to_next_notify", staticmethod(lambda _notify_time: 45))
+
+    configure({"digest": {"enabled": True, "notify_time": "20:00", "refresh_hours": 1}})
+    scheduler = DigestScheduler(
+        llm=object(),
+        get_loop=lambda: None,
+        digest_interval_override=30,
+    )
+    monkeypatch.setattr(scheduler, "_start_startup_digest_thread", lambda: startup_calls.append("startup"))
+
+    try:
+        scheduler.start()
+        assert [timer.delay for timer in created_timers[:2]] == [30, 45]
+        assert all(timer.started for timer in created_timers[:2])
+        assert startup_calls == ["startup"]
+
+        scheduler.reload(run_startup=True)
+        assert created_timers[0].cancelled is True
+        assert created_timers[1].cancelled is True
+        assert [timer.delay for timer in created_timers[2:4]] == [30, 45]
+        assert startup_calls == ["startup", "startup"]
+
+        scheduler.stop()
+        assert created_timers[2].cancelled is True
+        assert created_timers[3].cancelled is True
+    finally:
+        configure({"digest": {}})

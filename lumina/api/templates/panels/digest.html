@@ -1,13 +1,13 @@
-<div id="panel-digest" class="grid grid-cols-1 md:grid-cols-3 gap-8">
+<div id="panel-digest" class="grid grid-cols-1 md:grid-cols-3 gap-6">
   
   <!-- Main Content: 今日回顾 (2x2 Space) -->
   <section class="md:col-span-2 bento-card flex flex-col gap-8 min-h-[500px]">
-    <div class="flex justify-between items-center">
-      <div class="flex items-center gap-4">
+    <div class="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+      <div class="flex flex-col gap-4 lg:flex-row lg:items-center">
         <h3 class="text-2xl font-bold">今日回顾</h3>
         
         <!-- 子 tab bar (Segmented Control) - 整合到头部 -->
-        <div class="flex bg-zinc-100 dark:bg-zinc-800/50 rounded-xl p-1" id="digest-seg-ctrl">
+        <div class="flex w-fit bg-zinc-100 dark:bg-zinc-800/50 rounded-xl p-1" id="digest-seg-ctrl">
           <button class="px-4 py-1.5 text-sm font-bold rounded-lg bg-white dark:bg-zinc-700 shadow-sm transition-all" id="seg-snapshots"
                   hx-get="/fragments/digest"
                   hx-target="#digest-content"
@@ -15,19 +15,19 @@
                   hx-indicator="#digest-loading"
                   onclick="setDigestSeg('snapshots')">快照</button>
           <button class="px-4 py-1.5 text-sm font-bold rounded-lg text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100 transition-all" id="seg-daily"
-                  hx-get="/fragments/report/daily/latest"
+                  hx-get="/fragments/report/daily?key=latest"
                   hx-target="#digest-content"
                   hx-swap="innerHTML"
                   hx-indicator="#digest-loading"
                   onclick="setDigestSeg('daily')">日报</button>
           <button class="px-4 py-1.5 text-sm font-bold rounded-lg text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100 transition-all" id="seg-weekly"
-                  hx-get="/fragments/report/weekly/latest"
+                  hx-get="/fragments/report/weekly?key=latest"
                   hx-target="#digest-content"
                   hx-swap="innerHTML"
                   hx-indicator="#digest-loading"
                   onclick="setDigestSeg('weekly')">周报</button>
           <button class="px-4 py-1.5 text-sm font-bold rounded-lg text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100 transition-all" id="seg-monthly"
-                  hx-get="/fragments/report/monthly/latest"
+                  hx-get="/fragments/report/monthly?key=latest"
                   hx-target="#digest-content"
                   hx-swap="innerHTML"
                   hx-indicator="#digest-loading"
@@ -60,13 +60,106 @@
   </section>
 
   <!-- Sidebar Column -->
-  <div class="flex flex-col gap-8">
+  <div class="flex flex-col gap-6">
+    <section class="bento-card relative overflow-hidden">
+      <div class="absolute -right-10 -top-10 w-36 h-36 rounded-full bg-indigo-500/10 blur-3xl"></div>
+      <div class="relative">
+        <div class="flex items-start justify-between gap-4">
+          <div class="flex items-center gap-3">
+            <div class="w-10 h-10 bg-indigo-600 rounded-2xl flex items-center justify-center text-white font-bold text-xl shadow-lg">L</div>
+            <div>
+              <div class="text-[11px] font-bold uppercase tracking-[0.25em] text-indigo-500/80">System Ready</div>
+              <div class="text-[10px] text-zinc-500 mt-1">v0.8.0</div>
+            </div>
+          </div>
+          <div class="flex items-center gap-3">
+            <button onclick="toggleTheme()" class="glass p-3 rounded-2xl hover:bg-white/90 dark:hover:bg-zinc-800 transition-colors" aria-label="切换主题">
+              <span class="dark:hidden">🌙</span>
+              <span class="hidden dark:inline">☀️</span>
+            </button>
+            <div class="glass pl-3 pr-4 py-2 rounded-2xl flex items-center gap-3 text-xs font-semibold">
+              <div class="relative">
+                <span class="w-2.5 h-2.5 bg-emerald-500 rounded-full block"></span>
+                <span class="w-2.5 h-2.5 bg-emerald-500 rounded-full block absolute inset-0 animate-ping"></span>
+              </div>
+              Active
+            </div>
+          </div>
+        </div>
+
+        <div class="mt-6">
+          <h2 class="text-3xl font-extrabold tracking-tight" id="greeting">你好</h2>
+          <p
+            class="text-zinc-500 dark:text-zinc-400 mt-3 text-base leading-relaxed"
+            id="hero-slogan"
+            data-slogans='{{ slogan_candidates | default([]) | tojson | e }}'
+          >Lumina</p>
+        </div>
+
+        <script>
+          (function() {
+            const hour = new Date().getHours();
+            let greeting = '你好';
+            if (hour < 5) greeting = '夜深了';
+            else if (hour < 9) greeting = '早安';
+            else if (hour < 11) greeting = '上午好';
+            else if (hour < 13) greeting = '中午好';
+            else if (hour < 18) greeting = '下午好';
+            else if (hour < 22) greeting = '晚上好';
+            else greeting = '夜深了';
+
+            const username = "{{ username }}";
+            if (username) greeting += '，' + username;
+
+            const greetingEl = document.getElementById('greeting');
+            if (greetingEl) greetingEl.textContent = greeting;
+          })();
+        </script>
+        <script>
+          (function() {
+            const storageKey = 'lumina.heroSlogan';
+            const fallback = [
+              '让 AI 留在本地',
+              '在你的电脑上思考',
+              '你的本地 AI 工作台',
+              '把智能留给自己',
+              '本地运行，安心使用'
+            ];
+            const el = document.getElementById('hero-slogan');
+            let candidates = [];
+            if (el) {
+              try {
+                candidates = JSON.parse(el.dataset.slogans || '[]');
+              } catch (_) {
+                candidates = [];
+              }
+            }
+            const pool = Array.isArray(candidates) && candidates.length ? candidates : fallback;
+
+            let slogan = '';
+            try {
+              slogan = sessionStorage.getItem(storageKey) || '';
+              if (!pool.includes(slogan)) {
+                const idx = Math.floor(Math.random() * pool.length);
+                slogan = pool[idx];
+                sessionStorage.setItem(storageKey, slogan);
+              }
+            } catch (_) {
+              const idx = Math.floor(Math.random() * pool.length);
+              slogan = pool[idx];
+            }
+
+            if (el) el.textContent = slogan;
+          })();
+        </script>
+      </div>
+    </section>
       
     <!-- Data Pulse Card -->
     <section class="bento-card">
-      <h3 class="text-xl font-bold mb-6 flex justify-between items-center">
+      <h3 class="text-xl font-bold mb-4 flex justify-between items-center">
           数据源脉动
-          <span class="text-[10px] text-zinc-500 bg-zinc-100 dark:bg-zinc-800/50 px-2 py-1 rounded font-bold tracking-widest uppercase">24H 活动</span>
+          <span class="text-[10px] text-zinc-500 bg-zinc-100 dark:bg-zinc-800/50 px-2 py-1 rounded font-bold tracking-widest uppercase">默认摘要</span>
       </h3>
       
       <div id="digest-sources"
@@ -75,27 +168,22 @@
            hx-swap="innerHTML">
         <div class="text-zinc-500 text-sm text-center">加载中…</div>
       </div>
-
-      <!-- Storage Placeholder -->
-      <div class="mt-10 pt-8 border-t border-zinc-100 dark:border-zinc-800"
-           hx-get="/fragments/digest/storage" 
-           hx-trigger="load, every 300s, refreshStorage from:body">
-          <div class="text-zinc-500 text-xs text-center">加载存储空间信息…</div>
-      </div>
     </section>
 
-    <!-- Document Lab Entry -->
-    <section class="bento-card bg-indigo-600 dark:bg-indigo-600 text-white border-none group overflow-hidden relative cursor-pointer" onclick="document.getElementById('tab-translate').click(); updateNavStyles(document.querySelector(`label[for='tab-translate']`));">
+    <!-- Document Entry -->
+    <section class="bento-card bg-indigo-600 dark:bg-indigo-600 text-white border-none group overflow-hidden relative cursor-pointer" onclick="selectHomeTab('document')">
         <div class="relative z-10 h-full flex flex-col justify-between">
             <div>
-                <h3 class="text-2xl font-black italic">DOCUMENT LAB</h3>
+                <div class="text-[11px] uppercase tracking-[0.28em] text-indigo-100/80 font-bold">Workspace</div>
+                <h3 class="text-2xl font-black italic mt-2">DOCUMENT</h3>
                 <p class="text-indigo-100 text-sm mt-3 leading-relaxed opacity-90 font-medium">
-                    将 PDF 或 文献链接投喂给 Lumina，
-                    开启沉浸式智能解读模式。
+                    在一个入口里完成翻译与总结，
+                    文本、文件、链接都能直接处理。
                 </p>
             </div>
             <div class="mt-12 flex items-center justify-between">
                 <div class="flex -space-x-3">
+                    <div class="w-10 h-10 rounded-full border-2 border-indigo-600 bg-white/20 backdrop-blur flex items-center justify-center font-bold text-xs">TXT</div>
                     <div class="w-10 h-10 rounded-full border-2 border-indigo-600 bg-white/20 backdrop-blur flex items-center justify-center font-bold text-xs">PDF</div>
                     <div class="w-10 h-10 rounded-full border-2 border-indigo-600 bg-white/20 backdrop-blur flex items-center justify-center font-bold text-xs">URL</div>
                 </div>
@@ -107,6 +195,33 @@
             </div>
         </div>
         <!-- Decorative shapes -->
+        <div class="absolute -right-12 -bottom-12 w-48 h-48 bg-white/10 rounded-full blur-3xl group-hover:bg-white/20 transition-all duration-700"></div>
+    </section>
+
+    <!-- Image Entry -->
+    <section class="bento-card bg-emerald-600 dark:bg-emerald-600 text-white border-none group overflow-hidden relative cursor-pointer" onclick="selectHomeTab('image')">
+        <div class="relative z-10 h-full flex flex-col justify-between">
+            <div>
+                <div class="text-[11px] uppercase tracking-[0.28em] text-emerald-100/80 font-bold">Vision</div>
+                <h3 class="text-2xl font-black italic mt-2">IMAGE</h3>
+                <p class="text-emerald-100 text-sm mt-3 leading-relaxed opacity-90 font-medium">
+                    对截图、照片和扫描件做 OCR 或 Caption，
+                    图片文件和图片链接都可以直接处理。
+                </p>
+            </div>
+            <div class="mt-12 flex items-center justify-between">
+                <div class="flex -space-x-3">
+                    <div class="w-10 h-10 rounded-full border-2 border-emerald-600 bg-white/20 backdrop-blur flex items-center justify-center font-bold text-xs">OCR</div>
+                    <div class="w-10 h-10 rounded-full border-2 border-emerald-600 bg-white/20 backdrop-blur flex items-center justify-center font-bold text-xs">IMG</div>
+                    <div class="w-10 h-10 rounded-full border-2 border-emerald-600 bg-white/20 backdrop-blur flex items-center justify-center font-bold text-xs">URL</div>
+                </div>
+                <div class="w-14 h-14 bg-white rounded-2xl flex items-center justify-center text-emerald-600 shadow-xl group-hover:translate-x-2 transition-transform duration-500">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3" />
+                    </svg>
+                </div>
+            </div>
+        </div>
         <div class="absolute -right-12 -bottom-12 w-48 h-48 bg-white/10 rounded-full blur-3xl group-hover:bg-white/20 transition-all duration-700"></div>
     </section>
 
