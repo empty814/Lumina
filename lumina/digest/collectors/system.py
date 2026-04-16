@@ -19,6 +19,67 @@ logger = logging.getLogger("lumina.digest")
 _GIT_SKIP_DIRS = {".git", ".venv", "node_modules", "build", "dist", "__pycache__", ".app"}
 
 
+def _normalize_history_command(cmd: str) -> str:
+    """将多行 shell 历史压成单行，避免续行污染摘要展示。"""
+    return " ".join(part.strip() for part in cmd.splitlines() if part.strip()).strip()
+
+
+def _parse_shell_history_lines(raw: list[str]) -> list[tuple[Optional[float], str]]:
+    """解析 zsh/bash 普通历史文件，按"一条命令"而不是"一行文本"产出。"""
+    entries: list[tuple[Optional[float], str]] = []
+    pending_ts: Optional[float] = None
+    current_ts: Optional[float] = None
+    current_cmd: Optional[str] = None
+
+    def _flush() -> None:
+        nonlocal current_ts, current_cmd
+        if current_cmd is None:
+            return
+        normalized = _normalize_history_command(current_cmd)
+        if normalized:
+            entries.append((current_ts, normalized))
+        current_ts = None
+        current_cmd = None
+
+    for raw_line in raw:
+        line = raw_line.rstrip("\n")
+        if line.startswith(": ") and ";" in line:
+            _flush()
+            try:
+                meta, cmd = line.split(";", 1)
+                ts_str = meta.split(":")[1].strip()
+                current_ts = float(ts_str)
+            except (ValueError, IndexError):
+                current_ts = None
+                cmd = line
+            current_cmd = cmd
+            pending_ts = None
+            continue
+
+        if line.startswith("#") and line[1:].isdigit():
+            _flush()
+            try:
+                pending_ts = float(line[1:])
+            except ValueError:
+                pending_ts = None
+            continue
+
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        if current_cmd is not None:
+            current_cmd += "\n" + stripped
+            continue
+
+        current_ts = pending_ts
+        current_cmd = stripped
+        pending_ts = None
+
+    _flush()
+    return entries
+
+
 def _walk_git_dirs(root: Path, max_depth: int = 4):
     """yield 深度 ≤ max_depth 的 .git 目录父路径（即仓库根），不进入忽略目录。"""
     def _recurse(path: Path, depth: int):
@@ -67,31 +128,17 @@ def collect_shell_history(n: int = 100) -> str:
                     entries.append((None, pending_cmd))
                 continue
 
-            for line in raw:
-                ts_val: Optional[float] = None
-                cmd = line
-                if line.startswith(": ") and ";" in line:
-                    try:
-                        meta, cmd = line.split(";", 1)
-                        ts_str = meta.split(":")[1].strip()
-                        ts_val = float(ts_str)
-                        has_timestamps = True
-                    except (ValueError, IndexError):
-                        pass
-                elif line.startswith("#") and line[1:].isdigit():
-                    continue
-
-                cmd = cmd.strip()
-                if not cmd:
-                    continue
-                entries.append((ts_val, cmd))
+            parsed_entries = _parse_shell_history_lines(raw)
+            if any(ts is not None for ts, _ in parsed_entries):
+                has_timestamps = True
+            entries.extend(parsed_entries)
 
         if not entries:
             return ""
 
         if has_timestamps:
             entries.sort(key=lambda item: item[0] or 0, reverse=True)
-            filtered = [cmd for ts, cmd in entries if ts is None or ts > cutoff]
+            filtered = [cmd for ts, cmd in entries if ts is not None and ts > cutoff]
         else:
             filtered = [cmd for _, cmd in reversed(entries)]
 
@@ -107,7 +154,7 @@ def collect_shell_history(n: int = 100) -> str:
 
         if not cmds:
             return ""
-        return "## 终端历史（最近命令）\n" + "\n".join(f"  {c}" for c in reversed(cmds))
+        return "## 终端历史（最近命令）\n" + "\n".join(f"  {c}" for c in cmds)
     except Exception as e:
         logger.debug("shell history: %s", e)
         return ""

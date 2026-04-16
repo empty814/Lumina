@@ -1,4 +1,18 @@
 {% if generating %}
+<div
+  class="hidden"
+  hx-get="/fragments/digest"
+  hx-trigger="load delay:2s"
+  hx-target="#digest-content"
+  hx-swap="innerHTML"
+></div>
+<div
+  class="hidden"
+  hx-get="/fragments/digest/sources"
+  hx-trigger="load delay:2s"
+  hx-target="#digest-sources"
+  hx-swap="innerHTML"
+></div>
 <div class="bento-card flex flex-col items-center justify-center min-h-[300px] text-zinc-500">
   <div class="text-4xl mb-4 animate-spin">⏳</div>
   <div class="font-bold">正在生成摘要…</div>

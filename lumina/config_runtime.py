@@ -171,6 +171,7 @@ def serialize_runtime_config(cfg: Any) -> dict[str, Any]:
             "enabled_collectors": cfg.digest.get("enabled_collectors") if isinstance(cfg.digest, dict) else None,
             "weekly_report_day": cfg.digest.get("weekly_report_day", 0) if isinstance(cfg.digest, dict) else 0,
             "monthly_report_day": cfg.digest.get("monthly_report_day", 1) if isinstance(cfg.digest, dict) else 1,
+            "ai_queries_max_source_chars": cfg.digest.get("ai_queries_max_source_chars", 4000) if isinstance(cfg.digest, dict) else 4000,
         },
         "ptt": {
             "enabled": cfg.ptt.enabled,

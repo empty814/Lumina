@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+pytestmark = pytest.mark.anyio
+
 
 def _make_app():
     """创建带 mock LLM + Transcriber 的 FastAPI 实例。"""
@@ -244,6 +246,19 @@ async def test_digest_sources_fragment_renders_summary_and_expandable_details(cl
     assert 'hx-get="/fragments/digest/storage"' in body
 
 
+async def test_digest_fragment_polls_while_generating(client):
+    with patch("lumina.digest.get_status", return_value={"generating": True, "generated_at": None}), \
+         patch("lumina.digest.load_digest", return_value="# placeholder"):
+        r = await client.get("/fragments/digest")
+
+    assert r.status_code == 200
+    body = r.text
+    assert "正在生成摘要" in body
+    assert 'hx-get="/fragments/digest"' in body
+    assert 'hx-trigger="load delay:2s"' in body
+    assert 'hx-target="#digest-content"' in body
+
+
 async def test_report_fragment_defaults_to_latest_and_lists_options(client, tmp_path):
     daily_dir = tmp_path / "reports" / "daily"
     weekly_dir = tmp_path / "reports" / "weekly"
@@ -371,7 +386,7 @@ def test_pdf_upload_path_traversal_stripped():
     assert ".." not in safe_name
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_pdf_upload_rejects_non_pdf(client):
     """上传非 PDF 后缀文件应返回 400。"""
     data = {"file": ("evil.exe", io.BytesIO(b"MZ"), "application/octet-stream")}

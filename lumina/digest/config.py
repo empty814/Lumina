@@ -31,6 +31,7 @@ class DigestConfig:
     notify_time: str = "20:00"    # 每日通知时间，格式 "HH:MM"，空字符串表示禁用
     weekly_report_day: int = 0    # 周报触发的星期几（0=周一 … 6=周日，ISO weekday()）
     monthly_report_day: int = 1   # 月报触发的日期（1-28，每月第几日）
+    ai_queries_max_source_chars: int = 4000
     enabled_collectors: Optional[List[str]] = None  # None = 全部启用
     enabled: bool = False  # False = 完全关闭 digest（不自动也不手动生成）
 
@@ -65,6 +66,7 @@ def configure(data: dict) -> None:
         notify_time=str(d.get("notify_time", "20:00")),
         weekly_report_day=max(0, min(6, int(d.get("weekly_report_day", 0)))),
         monthly_report_day=max(1, min(28, int(d.get("monthly_report_day", 1)))),
+        ai_queries_max_source_chars=max(1, int(d.get("ai_queries_max_source_chars", 4000))),
         enabled_collectors=d.get("enabled_collectors", None),
         enabled=bool(d.get("enabled", False)),
     )

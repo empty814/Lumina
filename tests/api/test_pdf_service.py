@@ -20,7 +20,7 @@ def test_pdf_job_manager_initial_state():
     assert manager._bg_tasks == set()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_pdf_job_manager_submit_creates_running_job():
     manager = PdfJobManager()
 
@@ -41,7 +41,7 @@ async def test_pdf_job_manager_submit_creates_running_job():
     await asyncio.sleep(0)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_pdf_job_manager_get_status_returns_job():
     manager = PdfJobManager()
 
@@ -69,7 +69,7 @@ def test_pdf_job_manager_get_file_returns_none_for_missing_job():
     assert manager.get_file("ghost", "mono") is None
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_pdf_job_manager_run_translate_updates_status_on_success(tmp_path):
     manager = PdfJobManager()
     pdf_input = tmp_path / "input.pdf"
@@ -92,7 +92,7 @@ async def test_pdf_job_manager_run_translate_updates_status_on_success(tmp_path)
         assert job["status"] in ("done", "running")
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_pdf_job_manager_run_translate_updates_status_on_error(tmp_path):
     manager = PdfJobManager()
     out_dir = str(tmp_path / "out_err")

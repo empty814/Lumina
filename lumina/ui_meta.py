@@ -100,13 +100,19 @@ def collector_sources(collectors: Optional[dict[str, Any]]) -> list[dict[str, An
     for item in COLLECTOR_DEFS:
         info = collectors.get(item["key"], {})
         chars = info.get("chars", 0) if isinstance(info, dict) else 0
+        active = chars > 0
         sources.append(
             {
                 "key": item["key"],
                 "name": item["label"],
                 "icon": item["icon"],
-                "active": chars > 0,
+                "active": active,
                 "chars": chars,
+                "detail": (
+                    f"最近 24 小时采集了 {chars} 字符"
+                    if active else
+                    "最近 24 小时无活动"
+                ),
             }
         )
     return sources

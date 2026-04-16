@@ -32,7 +32,7 @@
   "port": 31821,
   "log_level": "INFO",
   "digest": {
-    "_readme": "日报功能配置。enabled=true 开启定时采集与生成；scan_dirs 填 [] 表示不扫描任何目录，缺省时使用内置默认列表；enabled_collectors 为 null 时全部启用，填列表可按需只启用部分来源；notify_time 为每日推送时间（HH:MM），留空禁用；weekly_report_day: 0=周一…6=周日；monthly_report_day: 每月第几日（1-28）",
+    "_readme": "日报功能配置。enabled=true 开启定时采集与生成；scan_dirs 填 [] 表示不扫描任何目录，缺省时使用内置默认列表；enabled_collectors 为 null 时全部启用，填列表可按需只启用部分来源；notify_time 为每日推送时间（HH:MM），留空禁用；weekly_report_day: 0=周一…6=周日；monthly_report_day: 每月第几日（1-28）；AI 会话仅受时间窗口和单条最大长度限制。",
     "enabled": true,
     "scan_dirs": [
       "~/Documents",
@@ -59,6 +59,7 @@
     "notify_time": "20:00",
     "weekly_report_day": 0,
     "monthly_report_day": 1,
+    "ai_queries_max_source_chars": 4000,
     "enabled_collectors": null
   },
   "ptt": {

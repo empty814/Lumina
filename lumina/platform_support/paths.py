@@ -92,23 +92,3 @@ def calendar_db_path() -> Path | None:
         return None
     db = Path.home() / "Library/Group Containers/group.com.apple.calendar/Calendar.sqlitedb"
     return db if db.exists() else None
-
-
-def cursor_state_db_candidates() -> list[Path]:
-    if IS_WINDOWS:
-        patterns = [
-            "~/AppData/Roaming/Cursor/User/globalStorage/state.vscdb",
-            "~/AppData/Roaming/Cursor - Insiders/User/globalStorage/state.vscdb",
-        ]
-    elif IS_MACOS:
-        patterns = [
-            "~/Library/Application Support/Cursor/User/globalStorage/state.vscdb",
-            "~/Library/Application Support/Cursor - Insiders/User/globalStorage/state.vscdb",
-        ]
-    else:
-        patterns = [
-            "~/.config/Cursor/User/globalStorage/state.vscdb",
-            "~/.config/Cursor - Insiders/User/globalStorage/state.vscdb",
-            "~/.var/app/com.cursor.Cursor/config/Cursor/User/globalStorage/state.vscdb",
-        ]
-    return [p for p in (_expand(pattern) for pattern in patterns) if p.exists()]

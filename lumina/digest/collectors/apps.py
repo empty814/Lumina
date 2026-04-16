@@ -1,23 +1,20 @@
 """
 lumina/digest/collectors/apps.py — 应用程序数据源采集
 
-包含：浏览器历史、备忘录（Notes.app）、日历（Calendar.app）、AI 对话（Claude/Codex/Cursor）。
+包含：浏览器历史、备忘录（Notes.app）、日历（Calendar.app）、AI 对话（Claude/Codex/Cursor/Gemini）。
 """
 import json
 import logging
-import os
-import shutil
 import sqlite3
-import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from lumina.digest.config import get_cfg
 from lumina.platform_support.paths import (
     calendar_db_path,
     chromium_history_candidates,
-    cursor_state_db_candidates,
     firefox_profile_dirs,
     notes_db_path,
     safari_history_db,
@@ -238,12 +235,83 @@ def collect_calendar() -> str:
         return ""
 
 
-def collect_ai_queries(n: int = 50) -> str:
-    """从 Claude Code、Codex、Cursor 本地历史中提取用户最近的提问。"""
+_AI_QUERY_SKIP_PREFIXES = ("<", "[Previous conversation", "Summary:", "## ", "### ")
+_AI_QUERY_SOURCE_ORDER = ("Claude Code", "Codex", "Cursor", "Gemini")
+
+
+def _normalize_ai_query_text(text: str, *, max_chars: int) -> str:
+    text = " ".join((text or "").split()).strip()
+    if not text:
+        return ""
+    if any(text.startswith(prefix) for prefix in _AI_QUERY_SKIP_PREFIXES):
+        return ""
+    if len(text) > max_chars:
+        return ""
+    return text
+
+
+def _coerce_query_ts(value) -> Optional[float]:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        ts = float(value)
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            ts = float(raw)
+        except ValueError:
+            try:
+                ts = datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                return None
+    else:
+        return None
+
+    magnitude = abs(ts)
+    if magnitude > 1e14:
+        ts /= 1_000_000
+    elif magnitude > 1e11:
+        ts /= 1_000
+    return ts if ts > 0 else None
+
+
+def _extract_cursor_transcript_text(message: object) -> str:
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+        return "\n".join(parts).strip()
+    return ""
+
+
+def collect_ai_queries(n: int | None = None) -> str:
+    """从 Claude Code、Codex、Cursor、Gemini 本地历史中提取用户最近的提问。"""
     cfg = get_cfg()
     cutoff = time.time() - cfg.history_hours * 3600
+    max_source_chars = max(1, int(cfg.ai_queries_max_source_chars))
     try:
-        queries: list[tuple[float, str]] = []
+        source_queries: dict[str, list[tuple[float, str]]] = {
+            source: [] for source in _AI_QUERY_SOURCE_ORDER
+        }
+
+        def _append_query(source: str, ts: Optional[float], text: str) -> None:
+            normalized = _normalize_ai_query_text(text, max_chars=max_source_chars)
+            if not normalized:
+                return
+            if ts is None or ts <= cutoff:
+                return
+            source_queries[source].append((ts, normalized))
 
         # ── Claude Code: history.jsonl（display 字段）─────────────────────────
         history_file = Path.home() / ".claude" / "history.jsonl"
@@ -263,10 +331,7 @@ def collect_ai_queries(n: int = 50) -> str:
                     if ts and ts <= cutoff:
                         break
                     text = obj.get("display", "").strip()
-                    if text:
-                        queries.append((ts, text))
-                    if len(queries) >= n:
-                        break
+                    _append_query("Claude Code", ts, text)
             except Exception as e:
                 logger.debug("claude history.jsonl: %s", e)
 
@@ -278,7 +343,7 @@ def collect_ai_queries(n: int = 50) -> str:
                     projects_dir.rglob("*.jsonl"),
                     key=lambda p: p.stat().st_mtime,
                     reverse=True,
-                )[:20]
+                )
                 for jf in jsonl_files:
                     if jf.stat().st_mtime <= cutoff:
                         continue
@@ -286,7 +351,7 @@ def collect_ai_queries(n: int = 50) -> str:
                         lines = jf.read_text(errors="replace").splitlines()
                     except Exception:
                         continue
-                    for line in lines:
+                    for line in reversed(lines):
                         line = line.strip()
                         if not line:
                             continue
@@ -311,11 +376,7 @@ def collect_ai_queries(n: int = 50) -> str:
                                 c.get("text", "") for c in content
                                 if isinstance(c, dict) and c.get("type") == "text"
                             )
-                        content = content.strip()
-                        _skip_prefixes = ("<", "[Previous conversation", "Summary:", "## ", "### ")
-                        if (content and len(content) < 2000
-                                and not any(content.startswith(p) for p in _skip_prefixes)):
-                            queries.append((ts, content))
+                        _append_query("Claude Code", ts, str(content))
             except Exception as e:
                 logger.debug("claude projects jsonl: %s", e)
 
@@ -336,65 +397,92 @@ def collect_ai_queries(n: int = 50) -> str:
                     if ts and ts <= cutoff:
                         break
                     text = obj.get("text", "").strip()
-                    if text:
-                        queries.append((ts, text))
-                    if len(queries) >= n:
-                        break
+                    _append_query("Codex", ts, text)
             except Exception as e:
                 logger.debug("codex history.jsonl: %s", e)
 
-        # ── Cursor: state.vscdb（bubbleId:* 条目）────────────────────────────
-        # Cursor IDE 气泡无可靠时间戳；用 DB 文件 mtime 作为代理。
-        # 若 mtime <= cutoff，说明 DB 自 cutoff 时间窗口内未更新，跳过。
-        for cursor_db in cursor_state_db_candidates():
-            db_mtime = cursor_db.stat().st_mtime
-            if db_mtime > cutoff:
-                tmp_fd3, tmp_str3 = tempfile.mkstemp(suffix=".db", prefix="lumina_cursor_")
-                tmp = Path(tmp_str3)
-                try:
-                    os.close(tmp_fd3)
-                except OSError:
-                    pass
-                try:
-                    shutil.copy2(str(cursor_db), str(tmp))
-                    with sqlite3.connect(str(tmp), timeout=3) as conn:
-                        rows = conn.execute(
-                            "SELECT value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'"
-                            " AND length(value) < 4000"
-                        ).fetchall()
-                    for (value,) in rows:
+        # ── Cursor Agent: ~/.cursor/projects/*/agent-transcripts/*.jsonl ─────
+        cursor_projects_dir = Path.home() / ".cursor" / "projects"
+        if cursor_projects_dir.exists():
+            try:
+                transcript_files = sorted(
+                    cursor_projects_dir.glob("*/agent-transcripts/*/*.jsonl"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                for transcript_file in transcript_files:
+                    file_ts = transcript_file.stat().st_mtime
+                    if file_ts <= cutoff:
+                        continue
+                    try:
+                        lines = transcript_file.read_text(errors="replace").splitlines()
+                    except Exception:
+                        continue
+                    for line in reversed(lines):
+                        line = line.strip()
+                        if not line:
+                            continue
                         try:
-                            val = (bytes(value).decode("utf-8", errors="replace")
-                                   if isinstance(value, (bytes, bytearray)) else str(value))
-                            obj = json.loads(val)
-                            if not isinstance(obj, dict):
-                                continue
-                            if "humanChanges" not in obj or len(obj) > 15:
-                                continue
-                            text = obj.get("text", "").strip()
-                            if text and len(text) < 2000:
-                                queries.append((db_mtime, text))
+                            obj = json.loads(line)
                         except Exception:
                             continue
-                except Exception as e:
-                    logger.debug("cursor state.vscdb: %s", e)
-                finally:
-                    tmp.unlink(missing_ok=True)
+                        if not isinstance(obj, dict):
+                            continue
+                        if obj.get("role") != "user":
+                            continue
+                        ts = _coerce_query_ts(obj.get("timestamp")) or file_ts
+                        if ts <= cutoff:
+                            continue
+                        text = _extract_cursor_transcript_text(obj.get("message"))
+                        _append_query("Cursor", ts, text)
+            except Exception as e:
+                logger.debug("cursor agent transcripts: %s", e)
 
-        if not queries:
+        # ── Gemini CLI: ~/.gemini/tmp/*/logs.json（message 字段）──────────────
+        gemini_tmp_dir = Path.home() / ".gemini" / "tmp"
+        if gemini_tmp_dir.exists():
+            try:
+                log_files = sorted(
+                    gemini_tmp_dir.rglob("logs.json"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                for log_file in log_files:
+                    if log_file.stat().st_mtime <= cutoff:
+                        continue
+                    try:
+                        entries = json.loads(log_file.read_text(errors="replace"))
+                    except Exception:
+                        continue
+                    if not isinstance(entries, list):
+                        continue
+                    for entry in reversed(entries):
+                        if not isinstance(entry, dict):
+                            continue
+                        if entry.get("type") != "user":
+                            continue
+                        ts = _coerce_query_ts(entry.get("timestamp"))
+                        if ts and ts <= cutoff:
+                            break
+                        text = entry.get("message", "")
+                        _append_query("Gemini", ts, str(text).strip())
+            except Exception as e:
+                logger.debug("gemini logs.json: %s", e)
+
+        if not any(source_queries.values()):
             return ""
 
-        seen, deduped = set(), []
-        for ts, text in sorted(queries, key=lambda x: x[0], reverse=True):
-            key = text[:120]
-            if key not in seen:
-                seen.add(key)
-                deduped.append(text)
-            if len(deduped) >= n:
-                break
-
-        lines_out = [f"  {q[:200]}" for q in reversed(deduped)]
-        return "## AI 对话提问（过去 %.0fh）\n" % cfg.history_hours + "\n".join(lines_out)
+        blocks: list[str] = []
+        for source in _AI_QUERY_SOURCE_ORDER:
+            items = sorted(source_queries[source], key=lambda x: x[0], reverse=True)
+            lines = [text for _, text in items]
+            if not lines:
+                continue
+            rendered = "\n".join(f"  {text}" for text in lines)
+            blocks.append(f"### {source}\n{rendered}")
+        if not blocks:
+            return ""
+        return "## AI 对话提问（过去 %.0fh）\n" % cfg.history_hours + "\n\n".join(blocks)
     except Exception as e:
         logger.debug("ai queries: %s", e)
         return ""

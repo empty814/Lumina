@@ -328,6 +328,7 @@ def reset_config() -> None:
 # 所有 ~/.lumina/ 子路径集中在此定义，避免各模块重复构造。
 LUMINA_HOME = Path.home() / ".lumina"
 DIGEST_PATH = LUMINA_HOME / "digest.md"
+DIGEST_COLLECTOR_STATE_PATH = LUMINA_HOME / "digest_collectors.json"
 DIGEST_CONTEXT_LOG_DIR = LUMINA_HOME / "digest_context_log"
 DIGEST_SNAPSHOTS_DIR = LUMINA_HOME / "snapshots"
 REPORTS_DAILY_DIR = LUMINA_HOME / "reports" / "daily"

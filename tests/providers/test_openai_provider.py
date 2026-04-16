@@ -65,7 +65,7 @@ async def _collect(provider, text: str) -> list[str]:
 
 # ── 正常路径 ─────────────────────────────────────────────────────────────────
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_sse_basic_two_tokens():
     """两个 token，各自一行，正常返回。"""
     from lumina.providers.openai import OpenAIProvider
@@ -83,7 +83,7 @@ async def test_sse_basic_two_tokens():
 
 # ── Fix #1：SSE 跨 chunk 解析 ────────────────────────────────────────────────
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_sse_json_split_across_chunks():
     """Fix #1：单个 JSON 对象被 HTTP 层切成两个 chunk，
     不应解析失败或丢 token——line-buffer 逻辑必须等到完整行才解析。"""
@@ -100,7 +100,7 @@ async def test_sse_json_split_across_chunks():
     assert tokens == ["split"]
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_sse_multiple_events_in_one_chunk():
     """多个事件合并在一个 chunk 里（服务端批量 flush），全部应被解析。"""
     from lumina.providers.openai import OpenAIProvider
@@ -118,7 +118,7 @@ async def test_sse_multiple_events_in_one_chunk():
     assert tokens == ["A", "B"]
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_sse_empty_delta_skipped():
     """finish_reason 事件的 delta.content 为空，不应 yield 空字符串。"""
     from lumina.providers.openai import OpenAIProvider
@@ -135,7 +135,7 @@ async def test_sse_empty_delta_skipped():
     assert tokens == ["last token"]
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_sse_malformed_json_line_skipped():
     """格式错误的行不应导致异常，直接跳过。"""
     from lumina.providers.openai import OpenAIProvider

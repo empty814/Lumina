@@ -40,7 +40,7 @@
             {% else %}
               bg-zinc-50 dark:bg-zinc-800 opacity-30 filter grayscale
             {% endif %}"
-            title="{{ src.name }}{% if src.active %}：最近 24 小时采集了 {{ src.chars }} 字符{% else %}：最近 24 小时无活动{% endif %}">
+            title="{{ src.name }}：{{ src.detail }}">
           <span class="text-2xl">{{ src.icon }}</span>
           <span class="text-[8px] font-bold uppercase
               {% if src.active %}

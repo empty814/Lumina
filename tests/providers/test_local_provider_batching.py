@@ -154,7 +154,7 @@ async def _median_makespan(provider_factory, *, repeats: int, delays: list[float
     return statistics.median(samples), last_results
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_interleaved_scheduler_gives_late_request_token_before_first_request_finishes():
     provider = SyntheticInterleavedProvider(
         prefill_delay=0.03,
@@ -167,7 +167,7 @@ async def test_interleaved_scheduler_gives_late_request_token_before_first_reque
     assert results["req-1"]["first_token_offset"] < results["req-0"]["end_offset"]
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_batched_decode_strategy_preserves_per_request_output():
     provider = SyntheticBatchedDecodeProvider(
         prefill_delay=0.01,
@@ -181,7 +181,7 @@ async def test_batched_decode_strategy_preserves_per_request_output():
         assert results[f"req-{idx}"]["tokens"] == ["t1", "t2", "t3", "t4"]
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_batched_decode_strategy_reduces_makespan():
     delays = [0.0, 0.005, 0.01, 0.015]
     max_tokens = 6
@@ -307,7 +307,7 @@ async def _collect_text(
     return "".join(parts)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_batch_engine_matches_legacy_scheduler_outputs():
     if not MODEL_PATH.exists():
         pytest.skip("local model not available")
@@ -695,7 +695,7 @@ def test_render_prompt_falls_back_when_tokenizer_has_no_thinking_flag():
     assert prompt == "prompt"
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_generate_messages_uses_vlm_for_image_inputs(monkeypatch):
     provider = LocalProvider(model_path="synthetic", enable_warmup=False)
     provider._model = object()
@@ -745,7 +745,7 @@ async def test_generate_messages_uses_vlm_for_image_inputs(monkeypatch):
     assert getattr(captured["image"][0], "size", None) == (1, 1)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_generate_messages_stream_uses_vlm_for_image_inputs(monkeypatch):
     provider = LocalProvider(model_path="synthetic", enable_warmup=False)
     provider._model = object()

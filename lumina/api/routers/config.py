@@ -60,6 +60,7 @@ class DigestPatch(BaseModel):
     enabled_collectors: Optional[List[str]] = None
     weekly_report_day: Optional[int] = None
     monthly_report_day: Optional[int] = None
+    ai_queries_max_source_chars: Optional[int] = None
 
 
 class PttPatch(BaseModel):
@@ -222,6 +223,8 @@ async def patch_config_api(patch: ConfigPatch, request: Request):
                 dc["weekly_report_day"] = max(0, min(6, int(d.weekly_report_day)))
             if d.monthly_report_day is not None:
                 dc["monthly_report_day"] = max(1, min(28, int(d.monthly_report_day)))
+            if d.ai_queries_max_source_chars is not None:
+                dc["ai_queries_max_source_chars"] = max(1, int(d.ai_queries_max_source_chars))
             data["digest"] = dc
 
         # ── ptt ───────────────────────────────────────────────────────────────

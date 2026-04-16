@@ -20,6 +20,7 @@ def test_digest_config_defaults():
     assert cfg.history_hours == 24.0
     assert cfg.refresh_hours == 1.0
     assert cfg.notify_time == "20:00"
+    assert cfg.ai_queries_max_source_chars == 4000
     assert cfg.enabled_collectors is None
     assert cfg.enabled is False  # 默认关闭，需显式启用
 
@@ -31,12 +32,14 @@ def test_digest_config_configure():
         "history_hours": 12,
         "refresh_hours": 0.5,
         "notify_time": "09:00",
+        "ai_queries_max_source_chars": 5000,
         "enabled_collectors": ["collect_shell_history", "collect_git_logs"],
     }})
     cfg = get_cfg()
     assert cfg.history_hours == 12.0
     assert cfg.refresh_hours == 0.5
     assert cfg.notify_time == "09:00"
+    assert cfg.ai_queries_max_source_chars == 5000
     assert cfg.enabled_collectors == ["collect_shell_history", "collect_git_logs"]
     assert cfg.enabled is False
 
@@ -129,6 +132,86 @@ def test_collect_shell_history_reads_powershell_history(tmp_path):
     assert "Set-Location C:\\work" in text
 
 
+def test_collect_shell_history_keeps_latest_zsh_commands_first(tmp_path):
+    from lumina.digest.collectors import system as system_collectors
+    from lumina.digest.config import configure
+
+    history = tmp_path / ".zsh_history"
+    now = time.time()
+    history.write_text(
+        "\n".join(
+            [
+                f": {int(now - 7200)}:0;old command",
+                f": {int(now - 20)}:0;git push",
+                f": {int(now - 10)}:0;git status",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    configure({"digest": {"history_hours": 1}})
+
+    with patch("lumina.digest.collectors.system.shell_history_candidates", return_value=[history]):
+        text = system_collectors.collect_shell_history()
+
+    lines = text.splitlines()
+    assert "git status" in lines[1]
+    assert "git push" in lines[2]
+    assert "old command" not in text
+
+
+def test_collect_shell_history_merges_zsh_continuation_lines(tmp_path):
+    from lumina.digest.collectors import system as system_collectors
+    from lumina.digest.config import configure
+
+    history = tmp_path / ".zsh_history"
+    now = int(time.time())
+    history.write_text(
+        "\n".join(
+            [
+                f": {now}:0;ffmpeg -i input1 \\",
+                "-c copy out1 \\",
+                "-map 0 out2",
+                f": {now + 1}:0;git status",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    configure({"digest": {"history_hours": 24}})
+
+    with patch("lumina.digest.collectors.system.shell_history_candidates", return_value=[history]):
+        text = system_collectors.collect_shell_history()
+
+    assert "ffmpeg -i input1 \\ -c copy out1 \\ -map 0 out2" in text
+    assert text.count("ffmpeg -i") == 1
+    assert "git status" in text
+
+
+def test_collect_shell_history_reads_bash_timestamp_format(tmp_path):
+    from lumina.digest.collectors import system as system_collectors
+    from lumina.digest.config import configure
+
+    history = tmp_path / ".bash_history"
+    now = int(time.time())
+    history.write_text(
+        "\n".join(
+            [
+                f"#{now - 7200}",
+                "stale bash command",
+                f"#{now - 30}",
+                "python app.py",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    configure({"digest": {"history_hours": 1}})
+
+    with patch("lumina.digest.collectors.system.shell_history_candidates", return_value=[history]):
+        text = system_collectors.collect_shell_history()
+
+    assert "python app.py" in text
+    assert "stale bash command" not in text
+
+
 def test_collect_browser_history_reads_chromium_candidates(tmp_path):
     from lumina.digest.collectors import apps as app_collectors
     from lumina.digest.config import configure
@@ -155,30 +238,239 @@ def test_collect_browser_history_reads_chromium_candidates(tmp_path):
     assert "Edge page" in text
 
 
-def test_collect_ai_queries_reads_cursor_candidates(tmp_path):
+def test_collect_ai_queries_reads_cursor_transcripts(tmp_path, monkeypatch):
     from lumina.digest.collectors import apps as app_collectors
     from lumina.digest.config import configure
 
-    cursor_db = tmp_path / "state.vscdb"
-    import sqlite3
-
-    with sqlite3.connect(cursor_db) as conn:
-        conn.execute("CREATE TABLE cursorDiskKV (key TEXT, value TEXT)")
-        conn.execute(
-            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
-            (
-                "bubbleId:1",
-                json.dumps({"humanChanges": True, "text": "How does the Windows backend work?"}),
-            ),
-        )
-        conn.commit()
-
-    os.utime(cursor_db, None)
+    home = tmp_path / "home"
+    transcript_dir = home / ".cursor" / "projects" / "demo" / "agent-transcripts" / "chat"
+    transcript_dir.mkdir(parents=True)
+    monkeypatch.setattr(app_collectors.Path, "home", lambda: home)
+    (transcript_dir / "chat.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({"role": "assistant", "message": {"content": [{"type": "text", "text": "ignore"}]}}),
+                json.dumps(
+                    {
+                        "role": "user",
+                        "message": {"content": [{"type": "text", "text": "How does the Windows backend work?"}]},
+                    }
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
     configure({"digest": {"history_hours": 24}})
-    with patch("lumina.digest.collectors.apps.cursor_state_db_candidates", return_value=[cursor_db]):
-        text = app_collectors.collect_ai_queries()
+    text = app_collectors.collect_ai_queries()
 
     assert "Windows backend" in text
+
+
+def test_collect_ai_queries_only_limits_single_item_length(tmp_path, monkeypatch):
+    from lumina.digest.collectors import apps as app_collectors
+    from lumina.digest.config import configure
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(app_collectors.Path, "home", lambda: home)
+
+    long_text = "Explain the batching scheduler behavior with examples and queue timing details"
+    similar_text = "Explain the batching scheduler tradeoffs for GPU throughput and latency"
+    distinct_text = "How should collector failures be surfaced in digest UI?"
+    transcript_dir = home / ".cursor" / "projects" / "demo" / "agent-transcripts" / "chat"
+    transcript_dir.mkdir(parents=True)
+    (transcript_dir / "chat.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({"role": "user", "message": {"content": [{"type": "text", "text": long_text}]}}),
+                json.dumps({"role": "user", "message": {"content": [{"type": "text", "text": similar_text}]}}),
+                json.dumps({"role": "user", "message": {"content": [{"type": "text", "text": distinct_text}]}}),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    configure(
+        {
+            "digest": {
+                "history_hours": 24,
+                "ai_queries_max_source_chars": 120,
+            }
+        }
+    )
+    text = app_collectors.collect_ai_queries()
+
+    assert "Explain the batching scheduler behavior with examples and queue timing details" in text
+    assert "Explain the batching scheduler tradeoffs for GPU throughput and latency" in text
+    assert "How should collector failures be surfaced in digest UI?" in text
+
+    configure({"digest": {"history_hours": 24, "ai_queries_max_source_chars": 50}})
+    shorter_text = app_collectors.collect_ai_queries()
+
+    assert "Explain the batching scheduler behavior with examples and queue timing details" not in shorter_text
+    assert "Explain the batching scheduler tradeoffs for GPU throughput and latency" not in shorter_text
+    assert "How should collector failures be surfaced in digest UI?" not in shorter_text
+
+
+def test_collect_ai_queries_groups_sources_without_count_limits(tmp_path, monkeypatch):
+    from lumina.digest.collectors import apps as app_collectors
+    from lumina.digest.config import configure
+
+    home = tmp_path / "home"
+    (home / ".claude" / "projects" / "demo").mkdir(parents=True)
+    (home / ".codex").mkdir(parents=True)
+    (home / ".gemini" / "tmp" / "demo").mkdir(parents=True)
+    (home / ".cursor" / "projects" / "demo" / "agent-transcripts" / "chat").mkdir(parents=True)
+
+    now = int(time.time())
+    (home / ".claude" / "history.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({"timestamp": (now - 20) * 1000, "display": "Claude latest prompt"}),
+                json.dumps({"timestamp": (now - 10) * 1000, "display": "Claude second prompt"}),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (home / ".claude" / "projects" / "demo" / "chat.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "timestamp": datetime.fromtimestamp(now - 15).isoformat(),
+                "message": {"content": "Claude project prompt"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (home / ".codex" / "history.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({"ts": now - 5, "text": "Codex latest prompt"}),
+                json.dumps({"ts": now - 4, "text": "Codex extra prompt"}),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (home / ".gemini" / "tmp" / "demo" / "logs.json").write_text(
+        json.dumps(
+            [
+                {
+                    "sessionId": "old",
+                    "messageId": 0,
+                    "type": "user",
+                    "message": "Old gemini prompt",
+                    "timestamp": datetime.fromtimestamp(now - 172800).isoformat(),
+                },
+                {
+                    "sessionId": "new",
+                    "messageId": 1,
+                    "type": "user",
+                    "message": "Gemini latest prompt",
+                    "timestamp": datetime.fromtimestamp(now - 2).isoformat(),
+                },
+                {
+                    "sessionId": "new",
+                    "messageId": 2,
+                    "type": "assistant",
+                    "message": "Gemini assistant reply",
+                    "timestamp": datetime.fromtimestamp(now - 1).isoformat(),
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    (home / ".cursor" / "projects" / "demo" / "agent-transcripts" / "chat" / "chat.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "role": "user",
+                        "timestamp": datetime.fromtimestamp(now - 3).isoformat(),
+                        "message": {"content": [{"type": "text", "text": "Cursor latest prompt"}]},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "role": "assistant",
+                        "timestamp": datetime.fromtimestamp(now - 2).isoformat(),
+                        "message": {"content": [{"type": "text", "text": "Ignore assistant reply"}]},
+                    }
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(app_collectors.Path, "home", lambda: home)
+    configure(
+        {
+            "digest": {
+                "history_hours": 24,
+                "ai_queries_max_source_chars": 300,
+            }
+        }
+    )
+
+    text = app_collectors.collect_ai_queries()
+
+    assert "### Claude Code" in text
+    assert "### Codex" in text
+    assert "### Cursor" in text
+    assert "### Gemini" in text
+    assert "Claude latest prompt" in text
+    assert "Claude second prompt" in text
+    assert "Claude project prompt" in text
+    assert "Codex latest prompt" in text
+    assert "Codex extra prompt" in text
+    assert "Cursor latest prompt" in text
+    assert "Gemini latest prompt" in text
+    assert "Old gemini prompt" not in text
+
+
+def test_collect_ai_queries_cursor_uses_transcript_timestamp_when_available(tmp_path, monkeypatch):
+    from lumina.digest.collectors import apps as app_collectors
+    from lumina.digest.config import configure
+
+    home = tmp_path / "home"
+    transcript_dir = home / ".cursor" / "projects" / "demo" / "agent-transcripts" / "chat"
+    transcript_dir.mkdir(parents=True)
+    monkeypatch.setattr(app_collectors.Path, "home", lambda: home)
+    now = int(time.time())
+    transcript = transcript_dir / "chat.jsonl"
+    transcript.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "role": "user",
+                        "timestamp": datetime.fromtimestamp(now - 172800).isoformat(),
+                        "message": {"content": [{"type": "text", "text": "Old cursor prompt"}]},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "role": "user",
+                        "timestamp": datetime.fromtimestamp(now - 30).isoformat(),
+                        "message": {"content": [{"type": "text", "text": "Recent cursor prompt"}]},
+                    }
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    os.utime(transcript, (now, now))
+    configure(
+        {
+            "digest": {
+                "history_hours": 24,
+                "ai_queries_max_source_chars": 300,
+            }
+        }
+    )
+
+    text = app_collectors.collect_ai_queries()
+
+    assert "Recent cursor prompt" in text
+    assert "Old cursor prompt" not in text
 
 
 # ── enabled_collectors 过滤 ────────────────────────────────────────────────────
@@ -335,7 +627,7 @@ def test_get_status_recovers_generated_at_from_existing_digest(tmp_path):
     assert status["generated_at"] == datetime.fromtimestamp(mtime).isoformat()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_maybe_generate_digest_skips_when_lock_held(tmp_path):
     """asyncio.Lock 持有期间，并发的 maybe_generate_digest 调用应该直接跳过，不重入。"""
     import asyncio
@@ -414,9 +706,143 @@ def test_digest_state_to_status_returns_snapshot():
     assert "generated_at" in status
 
 
+def test_get_debug_info_recovers_persisted_collector_state(tmp_path):
+    import lumina.digest.core as core
+
+    persisted = {
+        "saved_at": "2026-04-16T12:00:00",
+        "process_started_ts": 123.0,
+        "collectors": {
+            "collect_ai_queries": {
+                "chars": 0,
+                "lines": 0,
+                "preview": None,
+                "permission_denied": False,
+                "error": "timeout after 30s",
+            }
+        },
+    }
+    state_path = tmp_path / "digest_collectors.json"
+    state_path.write_text(json.dumps(persisted), encoding="utf-8")
+
+    saved_results = core._state.last_collector_results
+    core._state.last_collector_results = {}
+    try:
+        with patch.object(core, "_COLLECTOR_STATE_PATH", state_path):
+            info = core.get_debug_info()
+    finally:
+        core._state.last_collector_results = saved_results
+
+    assert info["collectors"]["collect_ai_queries"]["error"] == "timeout after 30s"
+
+
+def test_dedupe_context_against_recent_keeps_structure_and_dedupes_within_section():
+    import lumina.digest.core as core
+
+    current = (
+        "当前时间：2026-04-16 22:37\n\n"
+        "## 浏览器历史（过去 24h）\n"
+        "  Lumina\n"
+        "  New page\n\n---\n\n"
+        "## AI 对话提问（过去 24h）\n"
+        "### Claude Code\n"
+        "  Same question\n"
+        "  New question"
+    )
+    recent = [
+        (
+            "当前时间：2026-04-16 21:37\n\n"
+            "## 浏览器历史（过去 24h）\n"
+            "  Lumina\n\n---\n\n"
+            "## AI 对话提问（过去 24h）\n"
+            "### Claude Code\n"
+            "  Same question"
+        )
+    ]
+
+    deduped = core._dedupe_context_against_recent(current, recent)
+
+    assert "当前时间：2026-04-16 22:37" in deduped
+    assert "## 浏览器历史（过去 24h）" in deduped
+    assert "  Lumina" not in deduped
+    assert "  New page" in deduped
+    assert "### Claude Code" in deduped
+    assert "  Same question" not in deduped
+    assert "  New question" in deduped
+
+
+def test_generate_digest_saves_raw_then_dedupes_against_previous_three(tmp_path):
+    import lumina.digest.core as core
+
+    context_dir = tmp_path / "digest_context_log"
+    context_dir.mkdir(parents=True)
+    for idx, content in enumerate(
+        [
+            "当前时间：old-1\n\n## 浏览器历史（过去 24h）\n  Oldest",
+            "当前时间：old-2\n\n## 浏览器历史（过去 24h）\n  Another",
+            "当前时间：old-3\n\n## 浏览器历史（过去 24h）\n  Lumina",
+            "当前时间：old-4\n\n## 浏览器历史（过去 24h）\n  Ignored",
+        ],
+        start=1,
+    ):
+        (context_dir / f"20260416_22010{idx}_raw.txt").write_text(content, encoding="utf-8")
+
+    captured = {}
+
+    class FakeLLM:
+        async def generate(self, user_text, task="chat", **kwargs):
+            captured["user_text"] = user_text
+            captured["task"] = task
+            return "digest body"
+
+    async def _run():
+        with patch.object(core, "_CONTEXT_LOG_DIR", context_dir), \
+             patch.object(core, "_collect_all", AsyncMock(return_value=(
+                 "当前时间：2026-04-16 22:37\n\n"
+                 "## 浏览器历史（过去 24h）\n"
+                 "  Lumina\n"
+                 "  Fresh line"
+             ))), \
+             patch.object(core, "_prepend_entry", lambda entry: None), \
+             patch.object(core, "_state") as mock_state:
+            mock_state.set_generating = lambda val: None
+            mock_state.set_generated = lambda ts: None
+            await core.generate_digest(FakeLLM())
+
+    import asyncio
+    asyncio.run(_run())
+
+    assert captured["task"] == "digest"
+    assert "  Lumina" not in captured["user_text"]
+    assert "  Fresh line" in captured["user_text"]
+    raw_logs = sorted(context_dir.glob("*_raw.txt"))
+    full_logs = sorted(context_dir.glob("*_full.txt"))
+    assert len(raw_logs) == 5
+    assert len(full_logs) == 1
+
+
+def test_collector_sources_only_exposes_activity_state():
+    from lumina.ui_meta import collector_sources
+
+    sources = collector_sources(
+        {
+            "collect_shell_history": {"chars": 42, "error": None, "permission_denied": False},
+            "collect_git_logs": {"chars": 0, "error": "timeout after 30s", "permission_denied": False},
+            "collect_notes_app": {"chars": 0, "error": None, "permission_denied": True},
+            "collect_ai_queries": {"chars": 0, "error": None, "permission_denied": False},
+        }
+    )
+    by_key = {item["key"]: item for item in sources}
+
+    assert by_key["collect_shell_history"]["active"] is True
+    assert by_key["collect_git_logs"]["active"] is False
+    assert by_key["collect_notes_app"]["active"] is False
+    assert by_key["collect_ai_queries"]["detail"] == "最近 24 小时无活动"
+
+
 # ── CollectorRunner ────────────────────────────────────────────────────────────
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_collector_runner_timeout_returns_exception():
     """超时 collector 返回 Exception，不阻塞其他 collector。"""
     from lumina.digest.core import CollectorRunner
@@ -442,7 +868,7 @@ async def test_collector_runner_timeout_returns_exception():
     assert results["_fast"] == "fast_result"
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_collector_runner_enabled_filter():
     """_collect_all 通过 enabled_collectors 过滤时，CollectorRunner 只运行选中的 collector。"""
     from lumina.digest.core import CollectorRunner
@@ -464,7 +890,7 @@ async def test_collector_runner_enabled_filter():
     assert called == ["a"]
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_maybe_generate_digest_skips_when_disabled():
     import lumina.digest.core as core
     from lumina.digest.config import configure
@@ -555,7 +981,7 @@ def test_find_missing_weekly_and_monthly_report_keys_skip_current_period(tmp_pat
     assert missing_monthly == ["2026-04"]
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_startup_backfill_reports_fills_historical_gaps(tmp_path, monkeypatch):
     import lumina.cli.server as server
     import lumina.cli.utils as cli_utils

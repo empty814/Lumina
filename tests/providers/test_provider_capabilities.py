@@ -25,7 +25,7 @@ class DummyProvider(BaseProvider):
         yield user_text
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_base_provider_rejects_image_messages_without_capability():
     provider = DummyProvider()
 
@@ -63,7 +63,7 @@ def test_local_provider_capabilities_follow_vlm_availability(monkeypatch):
     assert provider.capabilities.supports_image_input is True
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_llama_cpp_provider_forwards_sampling_parameters():
     captured = {}
 
