@@ -14,10 +14,17 @@ from datetime import datetime
 from pathlib import Path
 
 from lumina.digest.config import get_cfg
+from lumina.platform_support.paths import (
+    calendar_db_path,
+    chromium_history_candidates,
+    cursor_state_db_candidates,
+    firefox_profile_dirs,
+    notes_db_path,
+    safari_history_db,
+)
 
 logger = logging.getLogger("lumina.digest")
 
-_CALENDAR_DB = Path.home() / "Library/Group Containers/group.com.apple.calendar/Calendar.sqlitedb"
 _CALENDAR_CORE_OFFSET = 978307200  # CoreData epoch = Unix epoch - 978307200
 
 
@@ -26,26 +33,21 @@ def collect_browser_history(n: int = 50) -> str:
 
     始终按 history_hours 窗口全量查询，无增量状态。
     """
-    import sys as _sys
     cfg = get_cfg()
     cutoff_unix = time.time() - cfg.history_hours * 3600
     try:
         results: list[tuple[float, str]] = []  # (ts_unix, title_or_url)
 
-        # ── Chrome ────────────────────────────────────────────────────────────
-        if _sys.platform == "win32":
-            chrome_db = (Path.home() / "AppData" / "Local" /
-                         "Google" / "Chrome" / "User Data" / "Default" / "History")
-        elif _sys.platform == "darwin":
-            chrome_db = (Path.home() / "Library" / "Application Support" /
-                         "Google" / "Chrome" / "Default" / "History")
-        else:  # Linux
-            chrome_db = Path.home() / ".config" / "google-chrome" / "Default" / "History"
-        if chrome_db.exists():
+        # ── Chromium 系浏览器（Chrome / Edge / Brave / Chromium）──────────────
+        seen_db_paths: set[Path] = set()
+        for history_db in chromium_history_candidates():
+            if history_db in seen_db_paths:
+                continue
+            seen_db_paths.add(history_db)
             try:
                 chrome_offset = 11644473600 * 1_000_000
                 cutoff_chrome = int(cutoff_unix * 1_000_000 + chrome_offset)
-                uri = chrome_db.as_uri() + "?mode=ro&immutable=1"
+                uri = history_db.as_uri() + "?mode=ro&immutable=1"
                 with sqlite3.connect(uri, uri=True, timeout=3) as conn:
                     rows = conn.execute(
                         "SELECT title, url, last_visit_time FROM urls "
@@ -57,59 +59,51 @@ def collect_browser_history(n: int = 50) -> str:
                     ts_unix = (lv_time - chrome_offset) / 1_000_000
                     results.append((ts_unix, title or url))
             except Exception as e:
-                logger.debug("chrome history: %s", e)
+                logger.debug("chromium history %s: %s", history_db, e)
 
         # ── Firefox ───────────────────────────────────────────────────────────
-        if _sys.platform == "win32":
-            ff_profiles = Path.home() / "AppData" / "Roaming" / "Mozilla" / "Firefox" / "Profiles"
-        elif _sys.platform == "darwin":
-            ff_profiles = Path.home() / "Library" / "Application Support" / "Firefox" / "Profiles"
-        else:  # Linux
-            ff_profiles = Path.home() / ".mozilla" / "firefox"
-        if ff_profiles.exists():
-            for profile_dir in ff_profiles.iterdir():
-                places_db = profile_dir / "places.sqlite"
-                if not places_db.exists():
-                    continue
-                try:
-                    cutoff_ff = int(cutoff_unix * 1_000_000)
-                    uri = places_db.as_uri() + "?mode=ro&immutable=1"
-                    with sqlite3.connect(uri, uri=True, timeout=3) as conn:
-                        rows = conn.execute(
-                            "SELECT title, url, last_visit_date FROM moz_places "
-                            "WHERE last_visit_date > ? "
-                            "ORDER BY last_visit_date DESC LIMIT ?",
-                            (cutoff_ff, n)
-                        ).fetchall()
-                    for title, url, lv_date in rows:
-                        if lv_date:
-                            ts_unix = lv_date / 1_000_000
-                            results.append((ts_unix, title or url))
-                except Exception as e:
-                    logger.debug("firefox history: %s", e)
+        for profile_dir in firefox_profile_dirs():
+            places_db = profile_dir / "places.sqlite"
+            if not places_db.exists():
+                continue
+            try:
+                cutoff_ff = int(cutoff_unix * 1_000_000)
+                uri = places_db.as_uri() + "?mode=ro&immutable=1"
+                with sqlite3.connect(uri, uri=True, timeout=3) as conn:
+                    rows = conn.execute(
+                        "SELECT title, url, last_visit_date FROM moz_places "
+                        "WHERE last_visit_date > ? "
+                        "ORDER BY last_visit_date DESC LIMIT ?",
+                        (cutoff_ff, n)
+                    ).fetchall()
+                for title, url, lv_date in rows:
+                    if lv_date:
+                        ts_unix = lv_date / 1_000_000
+                        results.append((ts_unix, title or url))
+            except Exception as e:
+                logger.debug("firefox history %s: %s", places_db, e)
 
         # ── Safari（仅 macOS）────────────────────────────────────────────────
-        if _sys.platform == "darwin":
-            safari_db = Path.home() / "Library" / "Safari" / "History.db"
-            if safari_db.exists():
-                try:
-                    safari_offset = 978307200  # CoreData epoch
-                    cutoff_safari = cutoff_unix - safari_offset
-                    uri = safari_db.as_uri() + "?mode=ro&immutable=1"
-                    with sqlite3.connect(uri, uri=True, timeout=3) as conn:
-                        rows = conn.execute(
-                            "SELECT hi.url, hv.title, hv.visit_time "
-                            "FROM history_visits hv "
-                            "JOIN history_items hi ON hv.history_item = hi.id "
-                            "WHERE hv.visit_time > ? "
-                            "ORDER BY hv.visit_time DESC LIMIT ?",
-                            (cutoff_safari, n)
-                        ).fetchall()
-                    for url, title, vt in rows:
-                        ts_unix = vt + safari_offset
-                        results.append((ts_unix, title or url))
-                except Exception as e:
-                    logger.debug("safari history: %s", e)
+        safari_db = safari_history_db()
+        if safari_db is not None:
+            try:
+                safari_offset = 978307200  # CoreData epoch
+                cutoff_safari = cutoff_unix - safari_offset
+                uri = safari_db.as_uri() + "?mode=ro&immutable=1"
+                with sqlite3.connect(uri, uri=True, timeout=3) as conn:
+                    rows = conn.execute(
+                        "SELECT hi.url, hv.title, hv.visit_time "
+                        "FROM history_visits hv "
+                        "JOIN history_items hi ON hv.history_item = hi.id "
+                        "WHERE hv.visit_time > ? "
+                        "ORDER BY hv.visit_time DESC LIMIT ?",
+                        (cutoff_safari, n)
+                    ).fetchall()
+                for url, title, vt in rows:
+                    ts_unix = vt + safari_offset
+                    results.append((ts_unix, title or url))
+            except Exception as e:
+                logger.debug("safari history: %s", e)
 
         if not results:
             return ""
@@ -135,15 +129,12 @@ def collect_notes_app() -> str:
     macOS TCC 限制：打包后的 .app 需要「完整磁盘访问」才能读取备忘录数据库。
     若权限不足，返回特殊标记 '__PERMISSION_DENIED__'，由 core.py 转为提示信息。
     """
-    import sys as _sys
-    if _sys.platform != "darwin":
-        return ""
     import sqlite3 as _sqlite3
     cfg = get_cfg()
     cutoff = time.time() - cfg.history_hours * 3600
     try:
-        db_path = Path.home() / "Library/Group Containers/group.com.apple.notes/NoteStore.sqlite"
-        if not db_path.exists():
+        db_path = notes_db_path()
+        if db_path is None:
             return ""
 
         # CoreData epoch = Unix epoch - 978307200（2001-01-01 与 1970-01-01 的差值）
@@ -184,12 +175,10 @@ def collect_calendar() -> str:
     无状态：日历事件按时间窗口查，每次全量读取当前窗口。
     需要完整磁盘访问权限（与 Notes.app 同理）。
     """
-    import sys as _sys
-    if _sys.platform != "darwin":
-        return ""
     cfg = get_cfg()
     try:
-        if not _CALENDAR_DB.exists():
+        cal_db = calendar_db_path()
+        if cal_db is None:
             return ""
 
         now = time.time()
@@ -201,7 +190,7 @@ def collect_calendar() -> str:
         window_start = today_midnight - _CALENDAR_CORE_OFFSET
         window_end = now_core + cfg.history_hours * 3600
 
-        uri = _CALENDAR_DB.as_uri() + "?mode=ro&immutable=1"
+        uri = cal_db.as_uri() + "?mode=ro&immutable=1"
         with sqlite3.connect(uri, uri=True, timeout=3) as conn:
             rows = conn.execute(
                 """
@@ -357,9 +346,7 @@ def collect_ai_queries(n: int = 50) -> str:
         # ── Cursor: state.vscdb（bubbleId:* 条目）────────────────────────────
         # Cursor IDE 气泡无可靠时间戳；用 DB 文件 mtime 作为代理。
         # 若 mtime <= cutoff，说明 DB 自 cutoff 时间窗口内未更新，跳过。
-        cursor_db = (Path.home() / "Library" / "Application Support" /
-                     "Cursor" / "User" / "globalStorage" / "state.vscdb")
-        if cursor_db.exists():
+        for cursor_db in cursor_state_db_candidates():
             db_mtime = cursor_db.stat().st_mtime
             if db_mtime > cutoff:
                 tmp_fd3, tmp_str3 = tempfile.mkstemp(suffix=".db", prefix="lumina_cursor_")

@@ -15,6 +15,8 @@ import logging
 import subprocess
 import sys
 
+from lumina.platform_support.runtime import IS_MACOS
+
 logger = logging.getLogger("lumina.popup")
 
 _PILL_W = 600
@@ -344,9 +346,34 @@ function esc(t) {
 """
 
 
+def _build_popup_html(params: dict, *, bridge: str) -> str:
+    html = _POPUP_HTML
+    if bridge == "pywebview":
+        html = html.replace(
+            "window.webkit.messageHandlers.close.postMessage('')",
+            "pywebview.api.close()",
+        )
+        html = html.replace(
+            "window.webkit.messageHandlers.copy.postMessage(s.result)",
+            "pywebview.api.copy(s.result)",
+        )
+    return html + f"""
+<script>
+window.addEventListener('load', () => init({json.dumps(params)}));
+</script>
+"""
+
+
 # ── AppKit NSPanel 实现 ───────────────────────────────────────────────────────
 
 def _run_popup(params: dict):
+    """按平台选择 popup 后端。"""
+    if IS_MACOS:
+        return _run_popup_macos(params)
+    return _run_popup_pywebview(params)
+
+
+def _run_popup_macos(params: dict):
     """用 NSPanel + WKWebView 实现透明胶囊浮窗，在主线程运行。"""
     from AppKit import (
         NSApplication, NSApp, NSPanel, NSScreen,
@@ -423,16 +450,48 @@ def _run_popup(params: dict):
     controller.addScriptMessageHandler_name_(handler, "copy")
 
     # ── 加载 HTML ──
-    html_with_params = _POPUP_HTML + f"""
-<script>
-window.addEventListener('load', () => init({json.dumps(params)}));
-</script>
-"""
+    html_with_params = _build_popup_html(params, bridge="webkit")
     webview.loadHTMLString_baseURL_(html_with_params, None)
     panel.makeKeyAndOrderFront_(None)
 
     # ── Run Loop ──
     NSApp.run()
+
+
+def _run_popup_pywebview(params: dict):
+    """非 macOS 使用 pywebview 提供等价弹窗能力。"""
+    import webview
+
+    class _PopupApi:
+        def __init__(self):
+            self.window = None
+
+        def copy(self, text: str):
+            from lumina.platform_utils import clipboard_set
+
+            try:
+                clipboard_set(str(text))
+            finally:
+                if self.window is not None:
+                    self.window.destroy()
+
+        def close(self):
+            if self.window is not None:
+                self.window.destroy()
+
+    api = _PopupApi()
+    height = _pill_height(len(params.get("original", ""))) + 32
+    window = webview.create_window(
+        params.get("label", "Lumina"),
+        html=_build_popup_html(params, bridge="pywebview"),
+        js_api=api,
+        width=_PILL_W,
+        height=height,
+        resizable=False,
+        on_top=True,
+    )
+    api.window = window
+    webview.start()
 
 
 if __name__ == "__main__":

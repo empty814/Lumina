@@ -8,8 +8,9 @@ import json
 import logging
 import os
 import shutil
-import sys
 from pathlib import Path
+
+from lumina.platform_support.desktop import get_desktop_services
 
 logger = logging.getLogger("lumina")
 
@@ -242,20 +243,8 @@ def remove_pid():
 # ── 系统工具 ──────────────────────────────────────────────────────────────────
 
 def notify(title: str, message: str):
-    """发送系统通知（macOS App 打包模式）；其他平台/模式静默。"""
-    if sys.platform != "darwin" or _EDITION not in ("full", "lite"):
-        return
-    import subprocess
-    script = (
-        f'display notification "{message}" '
-        f'with title "{title}" '
-        f'sound name "default"'
-    )
-    try:
-        subprocess.Popen(["osascript", "-e", script],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception as e:
-        logger.debug("Notification failed: %s", e)
+    """发送系统通知。非打包开发模式也允许通知，便于跨平台一致性验证。"""
+    get_desktop_services(enable_notifications=True).notify(title, message)
 
 
 def is_port_in_use(host: str, port: int) -> bool:

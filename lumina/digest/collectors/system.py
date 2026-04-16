@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 from lumina.digest.config import get_cfg
+from lumina.platform_support.paths import shell_history_candidates
 
 logger = logging.getLogger("lumina.digest")
 
@@ -40,62 +41,69 @@ def collect_shell_history(n: int = 100) -> str:
     cfg = get_cfg()
     cutoff = time.time() - cfg.history_hours * 3600
     try:
-        zsh  = Path.home() / ".zsh_history"
-        bash = Path.home() / ".bash_history"
-        src  = zsh if zsh.exists() else (bash if bash.exists() else None)
-        if not src:
+        sources = [p for p in shell_history_candidates() if p.exists()]
+        if not sources:
             return ""
-        raw = src.read_text(errors="replace").splitlines()
+
+        entries: list[tuple[Optional[float], str]] = []
+        has_timestamps = False
+
+        for src in sources:
+            raw = src.read_text(errors="replace").splitlines()
+            if src.name == "fish_history":
+                pending_cmd: Optional[str] = None
+                for line in raw:
+                    if line.startswith("- cmd:"):
+                        pending_cmd = line.split(":", 1)[1].strip()
+                    elif pending_cmd and "when:" in line:
+                        try:
+                            ts_val = float(line.split("when:", 1)[1].strip())
+                            entries.append((ts_val, pending_cmd))
+                            has_timestamps = True
+                        except ValueError:
+                            entries.append((None, pending_cmd))
+                        pending_cmd = None
+                if pending_cmd:
+                    entries.append((None, pending_cmd))
+                continue
+
+            for line in raw:
+                ts_val: Optional[float] = None
+                cmd = line
+                if line.startswith(": ") and ";" in line:
+                    try:
+                        meta, cmd = line.split(";", 1)
+                        ts_str = meta.split(":")[1].strip()
+                        ts_val = float(ts_str)
+                        has_timestamps = True
+                    except (ValueError, IndexError):
+                        pass
+                elif line.startswith("#") and line[1:].isdigit():
+                    continue
+
+                cmd = cmd.strip()
+                if not cmd:
+                    continue
+                entries.append((ts_val, cmd))
+
+        if not entries:
+            return ""
+
+        if has_timestamps:
+            entries.sort(key=lambda item: item[0] or 0, reverse=True)
+            filtered = [cmd for ts, cmd in entries if ts is None or ts > cutoff]
+        else:
+            filtered = [cmd for _, cmd in reversed(entries)]
 
         cmds: list[str] = []
         seen: set[str] = set()
-        has_timestamps = False
-
-        for line in reversed(raw):
-            ts_val: Optional[float] = None
-            cmd = line
-
-            # 解析 zsh 扩展格式：": <unix_ts>:<elapsed>;<command>"
-            if line.startswith(": ") and ";" in line:
-                try:
-                    meta, cmd = line.split(";", 1)
-                    # meta = ": 1712500000:0"  →  parts[1] 是时间戳
-                    ts_str = meta.split(":")[1].strip()
-                    ts_val = float(ts_str)
-                    has_timestamps = True
-                except (ValueError, IndexError):
-                    pass
-
-            if ts_val is not None:
-                # 倒序迭代：遇到早于 cutoff 的记录即可停止
-                if ts_val <= cutoff:
-                    break
-
-            cmd = cmd.strip()
-            if not cmd or cmd in seen:
+        for cmd in filtered:
+            if cmd in seen:
                 continue
             seen.add(cmd)
             cmds.append(cmd)
             if len(cmds) >= n:
                 break
-
-        # 兜底：整个文件无可解析时间戳（bash history 或纯文本格式）
-        # → 回退到原来的取最近 n 条逻辑
-        if not has_timestamps:
-            cmds, seen = [], set()
-            for line in reversed(raw):
-                if line.startswith(": ") and ";" in line:
-                    line = line.split(";", 1)[1]
-                line = line.strip()
-                # 跳过 bash HISTTIMEFORMAT 产生的 "#<unix_ts>" 行
-                if line.startswith("#") and line[1:].isdigit():
-                    continue
-                if not line or line in seen:
-                    continue
-                seen.add(line)
-                cmds.append(line)
-                if len(cmds) >= n:
-                    break
 
         if not cmds:
             return ""

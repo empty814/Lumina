@@ -38,26 +38,34 @@ _QA_WORKFLOW_NAMES = [
 # ── Provider 工厂 ─────────────────────────────────────────────────────────────
 
 def build_provider(cfg):
+    from lumina.platform_support.runtime import resolve_provider_backend
+
     ptype = cfg.provider.type
-    if ptype == "openai":
+    backend = resolve_provider_backend(ptype)
+    if backend == "openai":
         from lumina.providers.openai import OpenAIProvider
         oa = cfg.provider.openai
         logger.info("Provider: OpenAI-compatible  base_url=%s  model=%s", oa.base_url, oa.model)
         return OpenAIProvider(base_url=oa.base_url, api_key=oa.api_key, model=oa.model)
-    elif ptype == "llama_cpp":
+    if backend == "llama_cpp":
         from lumina.providers.llama_cpp import LlamaCppProvider
         lc = cfg.provider.llama_cpp
-        logger.info("Provider: llama-cpp-python  model_path=%s  n_gpu_layers=%d",
-                    lc.model_path, lc.n_gpu_layers)
+        model_path = lc.model_path or cfg.provider.model_path
+        logger.info(
+            "Provider: llama-cpp-python  requested_type=%s  model_path=%s  n_gpu_layers=%d",
+            ptype,
+            model_path,
+            lc.n_gpu_layers,
+        )
         return LlamaCppProvider(
-            model_path=lc.model_path,
+            model_path=model_path,
             n_gpu_layers=lc.n_gpu_layers,
             n_ctx=lc.n_ctx,
         )
-    else:
-        from lumina.providers.local import LocalProvider
-        logger.info("Provider: Local (mlx)  model_path=%s", cfg.provider.model_path)
-        return LocalProvider(model_path=cfg.provider.model_path)
+
+    from lumina.providers.local import LocalProvider
+    logger.info("Provider: Local (mlx)  requested_type=%s  model_path=%s", ptype, cfg.provider.model_path)
+    return LocalProvider(model_path=cfg.provider.model_path)
 
 
 # ── Digest 定时器 ─────────────────────────────────────────────────────────────
@@ -527,12 +535,14 @@ def _run_with_menubar(fastapi_app, cfg, llm, config_path: str | None = None):
             threading.Timer(2.0, self._refresh_ip_label).start()
 
         def _open_ui(self, _):
-            import subprocess
-            subprocess.Popen(["open", f"http://127.0.0.1:{cfg.port}"])
+            from lumina.platform_utils import open_url
+
+            open_url(f"http://127.0.0.1:{cfg.port}")
 
         def _open_settings(self, _):
-            import subprocess
-            subprocess.Popen(["open", f"http://127.0.0.1:{cfg.port}/#settings"])
+            from lumina.platform_utils import open_url
+
+            open_url(f"http://127.0.0.1:{cfg.port}/#settings")
 
         def _restart(self, _):
             server.should_exit = True
@@ -580,11 +590,6 @@ def cmd_server(args):
     )
     from lumina.cli.setup import ensure_model, needs_lite_setup, lite_setup_wizard
 
-    ensure_model()
-
-    if needs_lite_setup():
-        lite_setup_wizard()
-
     if args.provider:
         os.environ["LUMINA_PROVIDER_TYPE"] = args.provider
     if args.model_path:
@@ -598,11 +603,15 @@ def cmd_server(args):
     if args.log_level:
         os.environ["LUMINA_LOG_LEVEL"] = args.log_level
 
+    if needs_lite_setup():
+        lite_setup_wizard()
+
     sync_user_config()
     from lumina.cli.utils import sync_static
     sync_static()
     config_path = getattr(args, "config", None) or resolve_config_path()
     cfg = get_config(config_path)
+    ensure_model(cfg)
 
     # 用 bundle 内置 config.json 的 system_prompts 作为默认值，
     # 用户 ~/.lumina/config.json 中有的 key 优先（已由 get_config 读入 cfg.system_prompts）
@@ -641,9 +650,9 @@ def cmd_server(args):
     )
 
     if is_port_in_use(cfg.host, cfg.port):
-        msg = f"端口 {cfg.port} 已被占用，Lumina 可能已在运行。\n请查看菜单栏图标，或运行 lumina stop 后重试。"
+        msg = f"端口 {cfg.port} 已被占用，Lumina 可能已在运行。\n请先检查现有 Lumina 进程，或运行 lumina stop 后重试。"
         print(f"\nERROR: {msg}\n")
-        notify("Lumina 已在运行", f"端口 {cfg.port} 已被占用，请查看菜单栏图标")
+        notify("Lumina 已在运行", f"端口 {cfg.port} 已被占用，请检查现有进程")
         sys.exit(1)
 
     from lumina import digest as _digest_mod
@@ -710,8 +719,7 @@ def cmd_server(args):
     if sys.platform == "darwin" and (_EDITION in ("full", "lite") or getattr(args, "menubar", False)):
         _run_with_menubar(fastapi_app, cfg, llm, config_path=config_path)
     else:
-        if sys.platform == "darwin":
-            _start_ptt(cfg, menubar_app=None)
+        _start_ptt(cfg, menubar_app=None)
         try:
             uvicorn.run(fastapi_app, host=cfg.host, port=cfg.port,
                         log_level=cfg.log_level.lower(), log_config=uvicorn_log_config(cfg.log_level))

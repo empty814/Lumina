@@ -1,8 +1,8 @@
 # Lumina
 
-你的 Mac 上运行的私人 AI 工具箱。不联网，不收费，不上传任何数据。
+你的桌面上运行的私人 AI 工具箱。不联网，不收费，不上传任何数据。
 
-[![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-black)](https://github.com/wnma3mz/Lumina)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-black)](https://github.com/wnma3mz/Lumina)
 [![License](https://img.shields.io/github/license/wnma3mz/Lumina)](LICENSE)
 
 ---
@@ -34,13 +34,43 @@ uv sync                        # 安装依赖（需要 uv）
 uv run lumina server           # 启动服务
 ```
 
+### 平台安装脚本
+
+- macOS：`uv sync && uv run lumina server`
+- Linux：`bash scripts/install_linux.sh`
+- Windows：`powershell -ExecutionPolicy Bypass -File scripts/install_windows.ps1`
+
+### 平台入口集成
+
+- Linux 文件管理器入口：`bash scripts/install_linux_desktop_entry.sh`
+- Windows 右键 `Send to`：`powershell -ExecutionPolicy Bypass -File scripts/install_windows_sendto.ps1`
+- 通用文件动作脚本：`uv run python scripts/lumina_file_action.py <translate|summarize|polish> <files...>`
+
+### 平台验证手册
+
+- Windows / Linux 手动验收清单：`docs/windows-linux-validation.md`
+
+### 支持矩阵
+
+| 能力 | macOS | Windows | Linux |
+|---|---|---|---|
+| Web UI / HTTP API | ✅ | ✅ | ✅ |
+| 本地模型默认后端 | MLX | llama.cpp | llama.cpp |
+| ASR 默认后端 | mlx-whisper | faster-whisper | faster-whisper |
+| PTT 录音转写粘贴 | ✅ | ✅ | ✅（依赖 `xdotool` / `ydotool` 等桌面工具时体验更完整） |
+| 结果弹窗 | NSPanel | pywebview | pywebview |
+| 系统通知 | ✅ | ✅ | ✅（依赖 `notify-send`） |
+| Finder Quick Action / 系统服务 | ✅ | 入口形态不同 | 入口形态不同 |
+| 日报 Apple 专属数据源（Notes / Calendar / Safari） | ✅ | — | — |
+
 ---
 
 ## 使用方式
 
 ### PDF 翻译 / 总结
 
-选中 PDF → 右键 → **快速操作** → 翻译 / 总结
+macOS：选中 PDF → 右键 → **快速操作** → 翻译 / 总结  
+Windows / Linux：可直接使用 Web UI 或命令行完成同样的翻译 / 总结流程
 
 输出文件：
 - `文件名-mono.pdf` — 纯中文版
@@ -55,7 +85,14 @@ lumina pdf https://arxiv.org/pdf/2104.09864        # 翻译 URL
 lumina pdf ./papers/ -o ./translated               # 翻译整个目录
 lumina summarize paper.pdf                         # 总结
 lumina summarize paper.pdf --stdout                # 总结并打印到终端
+uv run python scripts/lumina_file_action.py translate paper.pdf
+uv run python scripts/lumina_file_action.py summarize paper.pdf
 ```
+
+Windows / Linux 桌面入口可调用同一套文件动作脚本：
+- PDF：翻译 / 总结
+- TXT / MD：润色
+- 输出默认写回源文件同目录
 
 ---
 
@@ -69,16 +106,16 @@ curl -X POST http://127.0.0.1:31821/v1/digest/refresh  # 立即重新生成
 curl http://127.0.0.1:31821/v1/digest/export      # 下载完整历史（.md 文件）
 ```
 
-日报每小时自动更新，默认每天 20:00 推送 macOS 通知。采集范围：
+日报每小时自动更新，默认每天 20:00 推送系统通知。采集范围：
 
 | 数据来源 | 说明 |
 |---|---|
-| Shell 历史 | zsh 命令记录 |
+| Shell 历史 | zsh / bash / fish / PowerShell 历史 |
 | Git 提交 | 所有扫描目录内的 git log |
-| 浏览器历史 | Chrome / Firefox 最近访问 |
-| 备忘录 | Notes.app 最近修改条目 |
+| 浏览器历史 | Chrome / Edge / Brave / Chromium / Firefox / Safari（按平台可用） |
+| 备忘录 | Notes.app 最近修改条目（macOS） |
 | Markdown 笔记 | 扫描目录内 .md 文件 |
-| 日历 | 今日及近期日程 |
+| 日历 | 今日及近期日程（macOS） |
 | AI 对话 | Cursor IDE / Claude 等对话记录 |
 
 ---
@@ -107,6 +144,7 @@ http://127.0.0.1:31821/v1
     "type": "local",
     "model_path": null
   },
+  "whisper_model": "",
   "digest": {
     "scan_dirs": [],
     "history_hours": 24,
@@ -118,9 +156,11 @@ http://127.0.0.1:31821/v1
 
 | 字段 | 说明 | 默认值 |
 |---|---|---|
-| `provider.type` | `local`（本地模型）或 `openai`（远程接口） | `local` |
-| `provider.model_path` | 本地模型路径，`null` 时自动下载 | `null` |
+| `provider.type` | `local`（本地模型；macOS=MLX，Win/Linux=llama.cpp）或 `openai`（远程接口） | `local` |
+| `provider.model_path` | 本地模型路径，`null` 时按平台自动下载默认模型 | `null` |
+| `provider.llama_cpp.model_path` | 显式指定 GGUF 模型路径 | `null` |
 | `provider.openai.base_url` | 远程 API 地址（type=openai 时必填） | — |
+| `whisper_model` | 语音模型 ID，留空时按平台使用默认值 | `""` |
 | `digest.scan_dirs` | 日报扫描目录，空数组时扫描 Documents / Desktop 等默认目录 | `[]` |
 | `digest.history_hours` | 采集时间窗口（小时） | `24` |
 | `digest.refresh_hours` | 日报更新间隔（小时） | `1` |
@@ -137,10 +177,10 @@ http://127.0.0.1:31821/v1
 
 | 层 | 实现 |
 |---|---|
-| LLM 推理 | mlx-lm（Apple Silicon GPU） |
+| LLM 推理 | macOS: mlx-lm；Windows / Linux: llama-cpp-python |
 | HTTP 服务 | FastAPI + uvicorn，端口 `31821` |
-| 菜单栏 | rumps（.app / `--menubar` 模式） |
-| 打包 | PyInstaller，spec 在 `scripts/lumina_full.spec` |
+| 桌面入口 | macOS: rumps；Windows / Linux: CLI + pywebview / 系统通知 |
+| 打包 | macOS: PyInstaller `.app`；Windows / Linux: 源码运行 + 安装脚本 |
 | 包管理 | uv |
 
 ### 架构
@@ -161,8 +201,9 @@ http://127.0.0.1:31821/v1
 └──────────────────┬───────────────────────────────────┘
                    │
         ┌──────────▼──────────┐
-        │   LocalProvider     │  ←→  OpenAIProvider（远程）
-        │  mlx-lm 本地推理    │
+        │  ProviderResolver   │  ←→  OpenAIProvider（远程）
+        │  macOS: LocalProvider (mlx-lm)
+        │  Win/Linux: LlamaCppProvider
         └─────────────────────┘
 ```
 
@@ -195,7 +236,7 @@ GET  /v1/digest/export
 
 | 版本 | 说明 |
 |------|------|
-| **Full**（默认） | 首次启动自动下载本地模型（Qwen3.5-0.8B-4bit，约 622MB），无需联网推理 |
+| **Full**（默认） | 首次启动按平台自动下载本地模型：macOS 下载 MLX 模型，Windows / Linux 下载 GGUF 模型，无需联网推理 |
 | **Lite** | 不含模型，把请求转发到你自己的外部 OpenAI 兼容 API |
 
 ### 打包
@@ -203,6 +244,11 @@ GET  /v1/digest/export
 ```bash
 bash scripts/build_full.sh      # 构建 Lumina.app
 bash scripts/install_quick_action.sh  # 安装 Finder Quick Action
+bash scripts/install_linux.sh   # Linux 源码安装
+bash scripts/install_linux_desktop_entry.sh  # Linux 文件管理器入口
+# Windows:
+powershell -ExecutionPolicy Bypass -File scripts/install_windows.ps1
+powershell -ExecutionPolicy Bypass -File scripts/install_windows_sendto.ps1
 ```
 
 ### 目录结构

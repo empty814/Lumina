@@ -49,6 +49,7 @@ class ProviderPatch(BaseModel):
     model_path: Optional[str] = None
     sampling: Optional[SamplingPatch] = None
     openai: Optional[OpenAIPatch] = None
+    llama_cpp: Optional[dict] = None
 
 
 class DigestPatch(BaseModel):
@@ -148,6 +149,7 @@ async def get_config_api():
     return {
         "provider": {
             "type": cfg.provider.type,
+            "backend": cfg.provider.backend,
             "model_path": cfg.provider.model_path,
             "sampling": {
                 "temperature": cfg.provider.sampling.temperature,
@@ -162,6 +164,11 @@ async def get_config_api():
                 "base_url": cfg.provider.openai.base_url,
                 "api_key": cfg.provider.openai.api_key,
                 "model": cfg.provider.openai.model,
+            },
+            "llama_cpp": {
+                "model_path": cfg.provider.llama_cpp.model_path,
+                "n_gpu_layers": cfg.provider.llama_cpp.n_gpu_layers,
+                "n_ctx": cfg.provider.llama_cpp.n_ctx,
             },
         },
         "whisper_model": cfg.whisper_model,
@@ -247,6 +254,16 @@ async def patch_config_api(patch: ConfigPatch, request: Request):
                     oa["model"] = p.openai.model
                 prov["openai"] = oa
                 restart_required = True
+            if p.llama_cpp is not None:
+                lc = prov.get("llama_cpp", {})
+                if not isinstance(lc, dict):
+                    lc = {}
+                for field in ("model_path", "n_gpu_layers", "n_ctx"):
+                    val = p.llama_cpp.get(field)
+                    if val is not None:
+                        lc[field] = val
+                        restart_required = True
+                prov["llama_cpp"] = lc
             data["provider"] = prov
 
         # ── whisper_model ─────────────────────────────────────────────────────

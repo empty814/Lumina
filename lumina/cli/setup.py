@@ -10,12 +10,12 @@ import os
 import sys
 from pathlib import Path
 
+from lumina.platform_support.runtime import get_local_model_download_spec
+
 logger = logging.getLogger("lumina")
 
 _EDITION = os.environ.get("LUMINA_EDITION")
 _USER_CONFIG_PATH = Path.home() / ".lumina" / "config.json"
-_MODEL_REPO_ID = "mlx-community/Qwen3.5-0.8B-4bit"
-_MODEL_CACHE_DIR = Path.home() / ".lumina" / "models" / "qwen3.5-0.8b-4bit"
 
 
 def _provider_type_from_config() -> str:
@@ -28,30 +28,40 @@ def _provider_type_from_config() -> str:
         return "local"
 
 
-def ensure_model():
+def ensure_model(cfg=None):
     """
     Full 版启动时检测模型是否已下载；若无则从 HuggingFace 下载。
-    下载完成后更新 LUMINA_MODEL_PATH 环境变量。
+    下载完成后回填运行时 config 的本地模型路径。
     """
     if _EDITION != "full":
         return
 
-    # 若用户配置了非本地 provider，无需本地模型
-    if _provider_type_from_config() != "local":
+    provider_type = getattr(getattr(cfg, "provider", None), "type", None) or _provider_type_from_config()
+    spec = get_local_model_download_spec(provider_type)
+    if spec is None:
         return
 
     from lumina.cli.utils import notify
 
-    model_dir = _MODEL_CACHE_DIR
-    if model_dir.exists() and any(model_dir.glob("*.safetensors")):
-        logger.info("Model found at %s", model_dir)
-        os.environ.setdefault("LUMINA_MODEL_PATH", str(model_dir))
+    model_path = spec.local_path
+    if spec.backend == "mlx":
+        if model_path.exists() and any(model_path.glob("*.safetensors")):
+            logger.info("Model found at %s", model_path)
+            os.environ.setdefault("LUMINA_MODEL_PATH", str(model_path))
+            if cfg is not None:
+                cfg.provider.model_path = str(model_path)
+            return
+    elif model_path.exists():
+        logger.info("Model found at %s", model_path)
+        if cfg is not None:
+            cfg.provider.model_path = str(model_path)
+            cfg.provider.llama_cpp.model_path = str(model_path)
         return
 
     print()
     print("首次启动需要下载内置模型（约 622MB），请稍候…")
-    print(f"  来源：{_MODEL_REPO_ID}")
-    print(f"  目标：{model_dir}")
+    print(f"  来源：{spec.repo_id}")
+    print(f"  目标：{model_path}")
     if os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY"):
         proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
         print(f"  代理：{proxy}")
@@ -60,12 +70,21 @@ def ensure_model():
     notify("Lumina", "正在下载模型，请稍候（约 622MB）…")
 
     try:
-        from huggingface_hub import snapshot_download
-        model_dir.mkdir(parents=True, exist_ok=True)
-        snapshot_download(
-            repo_id=_MODEL_REPO_ID,
-            local_dir=str(model_dir),
-        )
+        if spec.backend == "mlx":
+            from huggingface_hub import snapshot_download
+
+            model_path.mkdir(parents=True, exist_ok=True)
+            snapshot_download(repo_id=spec.repo_id, local_dir=str(model_path))
+        else:
+            from huggingface_hub import hf_hub_download
+
+            model_path.parent.mkdir(parents=True, exist_ok=True)
+            hf_hub_download(
+                repo_id=spec.repo_id,
+                filename=spec.filename,
+                local_dir=str(model_path.parent),
+                local_dir_use_symlinks=False,
+            )
     except Exception as e:
         print(f"\n模型下载失败：{e}")
         print("请检查网络连接，或设置代理后重试：")
@@ -73,8 +92,12 @@ def ensure_model():
         notify("Lumina 下载失败", "模型下载失败，请检查网络后重新启动")
         sys.exit(1)
 
-    print(f"✓ 模型下载完成：{model_dir}")
-    os.environ["LUMINA_MODEL_PATH"] = str(model_dir)
+    print(f"✓ 模型下载完成：{model_path}")
+    os.environ["LUMINA_MODEL_PATH"] = str(model_path)
+    if cfg is not None:
+        cfg.provider.model_path = str(model_path)
+        if spec.backend == "llama_cpp":
+            cfg.provider.llama_cpp.model_path = str(model_path)
 
 
 def needs_lite_setup() -> bool:

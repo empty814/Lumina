@@ -3,8 +3,9 @@
 
 config.json 字段说明
 ─────────────────────
-provider.type        "local"（mlx，macOS）/ "llama_cpp"（Windows/CPU）/ "openai"（远程）
-provider.model_path  本地模型目录，null 时使用内置默认路径
+provider.type        "local"（本地模型；macOS=MLX，Win/Linux=llama.cpp）
+                     / "llama_cpp"（显式 llama.cpp）/ "openai"（远程）
+provider.model_path  本地模型路径，null 时按平台使用内置默认路径
 provider.sampling    采样参数默认值（与模型绑定）：
                        temperature / top_p / top_k / min_p
                        presence_penalty / repetition_penalty / max_tokens
@@ -28,13 +29,21 @@ request_history      LLM 请求历史记录配置（启用 / 保留 / 压缩 / �
 """
 import json
 import os
-import sys as _sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional
 
+from lumina.platform_support.runtime import (
+    DEFAULT_PROVIDER_TYPE,
+    default_provider_model_path,
+    normalize_provider_type,
+    resolve_local_model_path,
+    resolve_provider_backend,
+    resolve_whisper_model,
+)
+
 _CONFIG_PATH = Path(__file__).parent / "config.json"
-_DEFAULT_MODEL = str(Path.home() / ".lumina" / "models" / "qwen3.5-0.8b-4bit")
+_DEFAULT_MODEL = default_provider_model_path(DEFAULT_PROVIDER_TYPE)
 
 
 @dataclass
@@ -75,13 +84,13 @@ class SamplingConfig:
 
 @dataclass
 class LlamaCppConfig:
-    model_path: str = ""        # GGUF 模型文件路径（本地绝对路径）
+    model_path: str = field(default_factory=lambda: default_provider_model_path("llama_cpp"))
     n_gpu_layers: int = -1      # -1 = 全部放 GPU；0 = 纯 CPU
     n_ctx: int = 4096
 
 
 def _default_provider_type() -> str:
-    return "llama_cpp" if _sys.platform == "win32" else "local"
+    return DEFAULT_PROVIDER_TYPE
 
 
 @dataclass
@@ -91,6 +100,14 @@ class ProviderConfig:
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     openai: OpenAIProviderConfig = field(default_factory=OpenAIProviderConfig)
     llama_cpp: LlamaCppConfig = field(default_factory=LlamaCppConfig)
+    backend: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.type = normalize_provider_type(self.type)
+        self.model_path = resolve_local_model_path(self.model_path, self.type)
+        self.backend = resolve_provider_backend(self.type)
+        if not self.llama_cpp.model_path:
+            self.llama_cpp.model_path = default_provider_model_path("llama_cpp")
 
 
 class Config:
@@ -104,13 +121,20 @@ class Config:
         oa = p.get("openai", {})
         lc = p.get("llama_cpp", {})
         sc = p.get("sampling", {}) if isinstance(p.get("sampling"), dict) else {}
+        requested_provider_type = os.environ.get("LUMINA_PROVIDER_TYPE") or p.get("type", _default_provider_type())
+        requested_provider_type = normalize_provider_type(requested_provider_type)
+        provider_model_path = resolve_local_model_path(
+            os.environ.get("LUMINA_MODEL_PATH") or p.get("model_path"),
+            requested_provider_type,
+        )
+        llama_cpp_model_path = resolve_local_model_path(
+            lc.get("model_path") or provider_model_path,
+            "llama_cpp",
+        )
+
         self.provider = ProviderConfig(
-            type=os.environ.get("LUMINA_PROVIDER_TYPE") or p.get("type", _default_provider_type()),
-            model_path=(
-                os.environ.get("LUMINA_MODEL_PATH")
-                or p.get("model_path")
-                or _DEFAULT_MODEL
-            ),
+            type=requested_provider_type,
+            model_path=provider_model_path,
             sampling=SamplingConfig(
                 temperature=float(sc["temperature"]) if "temperature" in sc else 0.7,
                 top_p=float(sc["top_p"]) if "top_p" in sc else 0.8,
@@ -126,16 +150,15 @@ class Config:
                 model=os.environ.get("LUMINA_OPENAI_MODEL") or oa.get("model", ""),
             ),
             llama_cpp=LlamaCppConfig(
-                model_path=lc.get("model_path", ""),
+                model_path=llama_cpp_model_path,
                 n_gpu_layers=int(lc.get("n_gpu_layers", -1)),
                 n_ctx=int(lc.get("n_ctx", 4096)),
             ),
         )
 
         # ── ASR ───────────────────────────────────────────────────────────────
-        self.whisper_model: str = (
-            os.environ.get("LUMINA_WHISPER_MODEL")
-            or data.get("whisper_model", "mlx-community/whisper-tiny-mlx-4bit")
+        self.whisper_model: str = resolve_whisper_model(
+            os.environ.get("LUMINA_WHISPER_MODEL") or data.get("whisper_model")
         )
 
         # ── Server ────────────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 from .base import BaseProvider
 
-__all__ = ["BaseProvider", "LocalProvider", "OpenAIProvider"]
+__all__ = ["BaseProvider", "LocalProvider", "LlamaCppProvider", "OpenAIProvider"]
 
 
 def __getattr__(name: str):
@@ -8,6 +8,9 @@ def __getattr__(name: str):
     if name == "LocalProvider":
         from .local import LocalProvider
         return LocalProvider
+    if name == "LlamaCppProvider":
+        from .llama_cpp import LlamaCppProvider
+        return LlamaCppProvider
     if name == "OpenAIProvider":
         from .openai import OpenAIProvider
         return OpenAIProvider

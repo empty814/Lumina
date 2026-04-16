@@ -43,6 +43,8 @@ Continuous Batching 工作原理（_legacy_scheduler 路径）
   新方案：每次迭代 Phase1 prefill 新请求 + Phase2 推进已有请求，交错推进
   效果：TTFT(B) ≈ prefill(A) + 1 decode step，而非等 A 全部完成
 """
+from __future__ import annotations
+
 import asyncio
 import logging
 import threading
@@ -56,6 +58,7 @@ try:
     from mlx_lm.generate import _left_pad_prompts, _make_cache, cache as mlx_cache
     _MLX_AVAILABLE = True
 except ImportError:
+    mx = None  # type: ignore[assignment]
     _MLX_AVAILABLE = False
 
 from lumina.engine.scheduler import GenerationRequest
@@ -96,7 +99,7 @@ class _RequestSlot(GenerationRequest):
     """
     # dataclass 继承约束：父类有默认值的字段后不能出现无默认值字段，
     # 故 prompt_tokens 改为带默认值（调用方仍通过 keyword arg 传入）。
-    prompt_tokens: mx.array = field(default_factory=lambda: mx.array([]))
+    prompt_tokens: Any = field(default_factory=lambda: mx.array([]) if mx is not None else [])
     system_text: str = ""
     user_text: str = ""
 

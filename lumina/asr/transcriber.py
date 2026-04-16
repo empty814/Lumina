@@ -18,6 +18,7 @@ import sys
 from typing import Optional
 
 import numpy as np
+from lumina.platform_support.runtime import default_whisper_model
 
 # ── 后端选择 ──────────────────────────────────────────────────────────────────
 
@@ -25,17 +26,11 @@ if sys.platform == "darwin":
     # mlx-whisper 的 transcribe 接口与 openai-whisper 兼容
     import mlx_whisper as _mlx_whisper  # type: ignore[import]
     _BACKEND = "mlx"
-    _DEFAULT_WHISPER_MODEL = os.environ.get(
-        "LUMINA_WHISPER_MODEL",
-        "mlx-community/whisper-tiny-mlx-4bit",
-    )
+    _DEFAULT_WHISPER_MODEL = os.environ.get("LUMINA_WHISPER_MODEL", default_whisper_model())
 else:
     # faster-whisper 跨平台（CUDA GPU + CPU fallback）
     _BACKEND = "faster_whisper"
-    _DEFAULT_WHISPER_MODEL = os.environ.get(
-        "LUMINA_WHISPER_MODEL",
-        "tiny",
-    )
+    _DEFAULT_WHISPER_MODEL = os.environ.get("LUMINA_WHISPER_MODEL", default_whisper_model())
 
 # faster-whisper 模块级缓存，避免每次转写重新加载
 _fw_model_cache: dict = {}

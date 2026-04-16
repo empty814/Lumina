@@ -26,10 +26,11 @@ def main():
     multiprocessing.freeze_support()
     # babeldoc 用 multiprocessing.Process 做字体子集化；macOS 默认 spawn 会重走
     # CLI 入口导致 argparse 报错。fork 模式直接复制父进程内存，不重走入口。
-    try:
-        multiprocessing.set_start_method("fork")
-    except RuntimeError:
-        pass
+    if sys.platform == "darwin":
+        try:
+            multiprocessing.set_start_method("fork")
+        except RuntimeError:
+            pass
 
     from lumina.cli.server import cmd_server, cmd_stop, cmd_restart
     from lumina.cli.pdf import cmd_pdf, cmd_summarize, cmd_watch

@@ -96,6 +96,13 @@ class TestGetConfig:
         assert r.status_code == 200
         assert r.json()["provider"]["type"] == "local"
 
+    async def test_returns_provider_backend(self, client_and_llm):
+        app, _ = client_and_llm
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            r = await c.get("/v1/config")
+        assert r.status_code == 200
+        assert r.json()["provider"]["backend"] in {"mlx", "llama_cpp", "openai"}
+
     async def test_returns_sampling_params(self, client_and_llm):
         app, _ = client_and_llm
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
@@ -172,6 +179,12 @@ class TestPatchConfig:
         app, _ = client_and_llm
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             r = await c.patch("/v1/config", json={"provider": {"model_path": "/new/model"}})
+        assert r.json()["restart_required"] is True
+
+    async def test_patch_llama_cpp_requires_restart(self, client_and_llm):
+        app, _ = client_and_llm
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            r = await c.patch("/v1/config", json={"provider": {"llama_cpp": {"n_ctx": 8192}}})
         assert r.json()["restart_required"] is True
 
     async def test_patch_sampling_no_restart_required(self, client_and_llm):

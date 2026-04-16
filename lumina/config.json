@@ -1,7 +1,7 @@
 {
-  "_readme": "Lumina 配置文件。Full 版默认使用本地模型（provider.type=local）；Lite 版或连接远程服务时将 provider.type 改为 openai 并填写下方 openai 节点。",
+  "_readme": "Lumina 配置文件。Full 版默认使用本地模型（provider.type=local：macOS=MLX，Win/Linux=llama.cpp）；Lite 版或连接远程服务时将 provider.type 改为 openai 并填写下方 openai 节点。",
   "provider": {
-    "_readme": "type: local（本地模型）或 openai（远程 OpenAI 兼容接口）",
+    "_readme": "type: local（本地模型，按平台自动选后端）/ llama_cpp（显式 llama.cpp）/ openai（远程 OpenAI 兼容接口）",
     "type": "local",
     "model_path": null,
     "sampling": {
@@ -19,9 +19,15 @@
       "base_url": "",
       "api_key": "",
       "model": ""
+    },
+    "llama_cpp": {
+      "_readme": "显式使用 llama.cpp 时可填写 GGUF 文件路径；local 模式在 Win/Linux 下也会优先读取这里或 model_path",
+      "model_path": null,
+      "n_gpu_layers": -1,
+      "n_ctx": 4096
     }
   },
-  "whisper_model": "mlx-community/whisper-tiny-mlx-4bit",
+  "whisper_model": "",
   "host": "127.0.0.1",
   "port": 31821,
   "log_level": "INFO",

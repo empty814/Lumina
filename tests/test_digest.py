@@ -112,6 +112,75 @@ def test_md_hashes_missing_file_returns_empty(tmp_path):
         cursor_store.MD_HASHES_PATH = original_path
 
 
+# ── 平台采集路径适配 ────────────────────────────────────────────────────────────
+
+def test_collect_shell_history_reads_powershell_history(tmp_path):
+    from lumina.digest.collectors import system as system_collectors
+    from lumina.digest.config import configure
+
+    history = tmp_path / "ConsoleHost_history.txt"
+    history.write_text("Get-ChildItem\nSet-Location C:\\work\n", encoding="utf-8")
+    configure({"digest": {"history_hours": 24}})
+
+    with patch("lumina.digest.collectors.system.shell_history_candidates", return_value=[history]):
+        text = system_collectors.collect_shell_history()
+
+    assert "Get-ChildItem" in text
+    assert "Set-Location C:\\work" in text
+
+
+def test_collect_browser_history_reads_chromium_candidates(tmp_path):
+    from lumina.digest.collectors import apps as app_collectors
+    from lumina.digest.config import configure
+
+    history_db = tmp_path / "History"
+    import sqlite3
+
+    with sqlite3.connect(history_db) as conn:
+        conn.execute("CREATE TABLE urls (title TEXT, url TEXT, last_visit_time INTEGER)")
+        chrome_offset = 11644473600 * 1_000_000
+        now = int(time.time() * 1_000_000 + chrome_offset)
+        conn.execute(
+            "INSERT INTO urls (title, url, last_visit_time) VALUES (?, ?, ?)",
+            ("Edge page", "https://example.com", now),
+        )
+        conn.commit()
+
+    configure({"digest": {"history_hours": 24}})
+    with patch("lumina.digest.collectors.apps.chromium_history_candidates", return_value=[history_db]), \
+         patch("lumina.digest.collectors.apps.firefox_profile_dirs", return_value=[]), \
+         patch("lumina.digest.collectors.apps.safari_history_db", return_value=None):
+        text = app_collectors.collect_browser_history()
+
+    assert "Edge page" in text
+
+
+def test_collect_ai_queries_reads_cursor_candidates(tmp_path):
+    from lumina.digest.collectors import apps as app_collectors
+    from lumina.digest.config import configure
+
+    cursor_db = tmp_path / "state.vscdb"
+    import sqlite3
+
+    with sqlite3.connect(cursor_db) as conn:
+        conn.execute("CREATE TABLE cursorDiskKV (key TEXT, value TEXT)")
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            (
+                "bubbleId:1",
+                json.dumps({"humanChanges": True, "text": "How does the Windows backend work?"}),
+            ),
+        )
+        conn.commit()
+
+    os.utime(cursor_db, None)
+    configure({"digest": {"history_hours": 24}})
+    with patch("lumina.digest.collectors.apps.cursor_state_db_candidates", return_value=[cursor_db]):
+        text = app_collectors.collect_ai_queries()
+
+    assert "Windows backend" in text
+
+
 # ── enabled_collectors 过滤 ────────────────────────────────────────────────────
 
 def test_enabled_collectors_filters_active():

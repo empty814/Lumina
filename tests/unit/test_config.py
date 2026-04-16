@@ -4,10 +4,10 @@ unit/test_config.py — Config 加载、SamplingConfig 解析、环境变量覆�
 使用临时 JSON 文件，不依赖真实 ~/.lumina/config.json。
 """
 import json
-import os
 import pytest
 
-from lumina.config import Config, SamplingConfig, reset_config
+from lumina.config import Config, reset_config
+from lumina.platform_support import runtime as runtime_mod
 
 
 @pytest.fixture(autouse=True)
@@ -52,11 +52,34 @@ class TestBasicLoad:
         cfg = Config(_write_config(tmp_path, _base_config()))
         assert cfg.provider.model_path == "/tmp/model"
 
+    def test_provider_backend_is_derived(self, tmp_path):
+        cfg = Config(_write_config(tmp_path, _base_config()))
+        assert cfg.provider.backend in {"mlx", "llama_cpp", "openai"}
+
     def test_default_port_when_missing(self, tmp_path):
         data = _base_config()
         del data["port"]
         cfg = Config(_write_config(tmp_path, data))
         assert cfg.port == 31821
+
+    def test_missing_model_path_uses_platform_default(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(runtime_mod, "IS_MACOS", False)
+        monkeypatch.setattr(runtime_mod, "IS_WINDOWS", True)
+        monkeypatch.setattr(runtime_mod, "IS_LINUX", False)
+        data = _base_config()
+        data["provider"]["model_path"] = ""
+        cfg = Config(_write_config(tmp_path, data))
+        assert cfg.provider.backend == "llama_cpp"
+        assert cfg.provider.model_path.endswith(".gguf")
+
+    def test_legacy_mlx_whisper_model_maps_on_non_macos(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(runtime_mod, "IS_MACOS", False)
+        monkeypatch.setattr(runtime_mod, "IS_WINDOWS", True)
+        monkeypatch.setattr(runtime_mod, "IS_LINUX", False)
+        data = _base_config()
+        data["whisper_model"] = runtime_mod.DEFAULT_MLX_WHISPER_MODEL
+        cfg = Config(_write_config(tmp_path, data))
+        assert cfg.whisper_model == runtime_mod.DEFAULT_FASTER_WHISPER_MODEL
 
     def test_system_prompts_loaded(self, tmp_path):
         data = {**_base_config(), "system_prompts": {"chat": "You are helpful."}}
