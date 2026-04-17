@@ -63,12 +63,15 @@ async def chat_completions(request: ChatCompletionRequest, raw: Request):
     task = translate_task or "chat"
 
     # 翻译任务参数覆写：
+    #   system_override 置空：pdf2zh user message 已内含完整翻译指令，
+    #     再叠加 system prompt 会导致指令冲突，模型将 prompt 内容输出到译文
     #   max_tokens 不足时补到下限（pdf2zh 不传 max_tokens，512 会截断长段落）
     #   presence_penalty/repetition_penalty 归零（翻译需忠实复现原文词汇）
     max_tokens = request.max_tokens
     presence_penalty = request.presence_penalty
     repetition_penalty = request.repetition_penalty
     if translate_task:
+        system_override = system_override if system_override is not None else ""
         if max_tokens is None or max_tokens < _TRANSLATE_MIN_MAX_TOKENS:
             max_tokens = _TRANSLATE_MIN_MAX_TOKENS
         if presence_penalty is None:
